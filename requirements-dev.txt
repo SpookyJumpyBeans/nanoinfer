@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Test-only. These are reference oracles, never imported by nanoinfer/.
+# The engine must never depend on them; tests/ compares against them.
+pytest>=8.0
+torch>=2.4
+transformers>=4.43
+tokenizers>=0.19

@@ -1,0 +1,2 @@
+# The engine's only runtime dependency. This list is a feature.
+numpy>=2.0

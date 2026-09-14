@@ -1,0 +1,18 @@
+# Model weights: ~1 GB, fetched with tools/download_model.py
+models/
+*.safetensors
+*.gguf
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Benchmark output is kept (it is the point), but scratch files are not
+bench/*.tmp
+scratch/
