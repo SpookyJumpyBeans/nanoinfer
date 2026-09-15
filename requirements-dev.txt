@@ -3,6 +3,12 @@
 # Test-only. These are reference oracles, never imported by nanoinfer/.
 # The engine must never depend on them; tests/ compares against them.
 pytest>=8.0
+
+# Phase 2 oracles: the Rust tokenizer, and Jinja to render the model's own
+# chat_template so our ChatML formatter is checked rather than asserted.
+tokenizers>=0.19
+jinja2>=3.1
+
+# Phase 3 oracle: reference logits for the forward pass. Not needed before then.
 torch>=2.4
 transformers>=4.43
-tokenizers>=0.19
