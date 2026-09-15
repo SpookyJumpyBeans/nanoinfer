@@ -17,8 +17,8 @@ The engine's entire runtime dependency list is `numpy`.
 | Phase | What | State |
 |------:|------|-------|
 | 1 | Parse safetensors, verify every tensor against the config | **done** |
-| 2 | BPE tokenizer, exact round-trip vs. the reference on 10k strings | next |
-| 3 | float32 forward pass, no cache, greedy; logits within 1e-3 of reference | |
+| 2 | BPE tokenizer, exact round-trip vs. the reference on 10k strings | **done** |
+| 3 | float32 forward pass, no cache, greedy; logits within 1e-3 of reference | next |
 | 4 | KV cache; bit-identical output, measured speedup | |
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | |
@@ -65,6 +65,29 @@ python -m bench.benchmark --compare
 Mapping the file is effectively free because nothing is read. The six seconds
 are spent paging 942 MiB off disk and doubling it into float32 — which is the
 cost that phase 6 exists to attack.
+
+### Phase 2 — tokenizer
+
+| Metric | Value |
+|---|---|
+| Corpus | 10,000 generated strings, 240,166 characters |
+| Token-ID agreement with reference | **10,000 / 10,000 exact** |
+| Decode agreement | 10,000 / 10,000 exact |
+| Throughput | 52,438 tok/s (pure Python) |
+| Reference throughput | 116,038 tok/s (Rust `tokenizers`) |
+| Gap | **2.2× slower** |
+| Tokenizer load | 1.87 s |
+| Peak RSS | 166 MB |
+
+2.2× off a Rust implementation is closer than pure Python has any right to be,
+and it is not cleverness in the merge loop — that loop is a deliberately
+obvious O(n²) scan. It is the per-pre-token merge cache: real text repeats the
+same pre-tokens relentlessly, so almost every lookup after the first thousand
+strings is a dict hit.
+
+The corpus averages 1.97 characters per token, which is far below the ~3.5–4 of
+natural English. That is the corpus doing its job — a third of it is random
+codepoints, control bytes and punctuation runs, which is where tokenizers break.
 
 Tokens/sec, perplexity, and the llama.cpp comparison land in phases 3–8.
 
@@ -121,6 +144,62 @@ converting on load is what makes memory-mapping worthwhile. The reverse
 direction rounds half-to-even, and the tests prove the round-trip is the
 identity over all 65,536 finite bf16 values.
 
+## The tokenizer
+
+Byte-level BPE, implemented in five pieces that each get their own module and
+their own tests:
+
+| | |
+|---|---|
+| [`bytelevel.py`](nanoinfer/bytelevel.py) | the 256-byte → printable-codepoint alphabet |
+| [`unicode_classes.py`](nanoinfer/unicode_classes.py) | `\p{L}`, `\p{N}` and `White_Space` built from `unicodedata` |
+| [`pretokenize.py`](nanoinfer/pretokenize.py) | NFC + the split regex, translated from the model's own file |
+| [`bpe.py`](nanoinfer/bpe.py) | the merge loop |
+| [`tokenizer.py`](nanoinfer/tokenizer.py) | added tokens, encode, decode |
+
+Nothing about Qwen is hardcoded. The split pattern, merge table, vocabulary and
+added tokens all come out of `tokenizer.json`, and unsupported spec fields are
+rejected at load time rather than ignored — so pointing this at a different
+model either works or fails loudly, never silently.
+
+### Three things that cost real time
+
+**Python's `\s` is not Rust's `\s`.** The split pattern ships as a Rust
+`regex` pattern. Python's `\s` matches the C0 separators U+001C–U+001F; the
+Unicode `White_Space` property, which Rust uses, does not. Building on `\s`
+gives a tokenizer that is correct on everything except inputs containing a file
+separator — which no small test corpus contains. The `White_Space` set is
+spelled out explicitly instead, and a test asserts the divergence is real
+rather than imagined.
+
+**BPE tie-breaking is load-bearing.** When two positions hold pairs of equal
+merge rank, the leftmost must merge first. The reference gets this from a
+`(rank, position)` priority queue. Choosing the rightmost produces different
+tokens only on repeated-character runs, which is exactly the kind of bug that
+survives a hand-written test list.
+
+**Added tokens must be extracted before the pre-tokenizer.** If `<|im_start|>`
+were fed through the split regex it would be shredded into `<`, `|`, `im`,
+`_start`, `|`, `>` and BPE would encode it as ordinary text. Every chat prompt
+would then be wrong — and still perfectly fluent.
+
+### Verification
+
+The gate is exact token-ID equality on 10,000 strings, checked before any model
+code exists. The corpus ([`tests/corpus.py`](tests/corpus.py)) is generated
+from one seed and weighted toward where byte-level BPE actually breaks rather
+than toward realism: whitespace torture, random assigned codepoints across all
+planes, combining marks, long repeated runs, and control-token lookalikes.
+
+ChatML formatting is checked the same way — by rendering the model's real Jinja
+`chat_template` with Jinja and requiring an exact string match, rather than
+asserting against hand-written expected output.
+
+```
+python -m pytest                      # 418 tests
+python -m bench.benchmark tokenize    # throughput vs the Rust reference
+```
+
 ## Two things about Qwen2.5 that will break a naive implementation
 
 **Tied embeddings.** `config.json` sets `tie_word_embeddings: true`, so there is
@@ -140,16 +219,23 @@ Llama-style models.
 
 ```
 nanoinfer/
-  safetensors.py   container parser, bf16 <-> f32
-  config.py        hyperparameters + derived shapes, with invariants asserted
-  metrics.py       timing and peak-RSS measurement, no dependencies
+  safetensors.py      container parser, bf16 <-> f32
+  config.py           hyperparameters + derived shapes, with invariants asserted
+  metrics.py          timing and peak-RSS measurement, no dependencies
+  bytelevel.py        the 256-byte printable alphabet
+  unicode_classes.py  Unicode property classes, so no `regex` dependency
+  pretokenize.py      NFC + the split regex
+  bpe.py              the merge loop
+  tokenizer.py        encode / decode / added tokens
+  chat.py             ChatML prompt formatting
 tools/
   download_model.py   four HTTPS GETs, no huggingface_hub
   inspect_weights.py  phase 1: prove every tensor is understood
 bench/
-  benchmark.py     append-only measurement harness
-  results.jsonl    every number ever recorded
+  benchmark.py        append-only measurement harness
+  results.jsonl       every number ever recorded
 tests/
+  corpus.py           the seeded 10,000-string differential corpus
 ```
 
 ## Running it
@@ -161,6 +247,8 @@ python -m venv .venv
 python -m tools.download_model                      # ~950 MB
 python -m tools.inspect_weights models/Qwen2.5-0.5B-Instruct
 python -m bench.benchmark load
+python -m bench.benchmark tokenize
+python -m bench.benchmark --compare
 python -m pytest
 ```
 

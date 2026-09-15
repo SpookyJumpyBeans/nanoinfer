@@ -10,6 +10,9 @@ Metrics, and why each one:
 
   load_s          Wall time from cold file to weights usable. Matters on
                   device, and it is the only timing phase 1 can produce.
+  tokenizer_tok_s Tokenizer throughput, with the Rust reference alongside
+                  it. Published even though we lose badly; that gap is the
+                  thing phase 7 has to close.
   ttft_ms         Time to first token: how long the prefill pass takes.
   decode_tok_s    Steady-state tokens per second after the first token. The
                   headline number, and the one the KV cache moves.
@@ -37,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from nanoinfer.config import ModelConfig  # noqa: E402
 from nanoinfer.metrics import machine_fingerprint, peak_rss_bytes  # noqa: E402
 from nanoinfer.safetensors import SafeTensors  # noqa: E402
+from nanoinfer.tokenizer import Tokenizer  # noqa: E402
 
 RESULTS_PATH = Path(__file__).resolve().parent / "results.jsonl"
 
@@ -53,6 +57,8 @@ class Result:
     load_s: float | None = None
     ttft_ms: float | None = None
     decode_tok_s: float | None = None
+    tokenizer_tok_s: float | None = None
+    reference_tok_s: float | None = None
     tokens_generated: int | None = None
     peak_rss_mb: float | None = None
     quantization: str = "none"
@@ -139,6 +145,79 @@ def scenario_load(args: argparse.Namespace) -> Result:
     )
 
 
+def scenario_tokenize(args: argparse.Namespace) -> Result:
+    """Measure tokenizer throughput, and how far behind the reference we are.
+
+    Publishing the losing number is the point. This is pure Python against a
+    Rust implementation, so the gap is large and expected; what matters is
+    that it is measured rather than hand-waved, and that it shrinks in phase 7.
+
+    The corpus is the same 10,000 strings the correctness test uses, so speed
+    and correctness are being reported over identical input.
+    """
+    from tests.corpus import generate
+
+    model_dir = Path(args.model)
+    corpus = generate()
+    total_chars = sum(len(s) for s in corpus)
+
+    t0 = time.perf_counter()
+    tok = Tokenizer.from_model_dir(model_dir)
+    load_s = time.perf_counter() - t0
+
+    # Warm the merge cache the way real use would, then measure steady state.
+    for text in corpus[:200]:
+        tok.encode(text)
+
+    t1 = time.perf_counter()
+    total_tokens = sum(len(tok.encode(text)) for text in corpus)
+    encode_s = time.perf_counter() - t1
+
+    ours = total_tokens / encode_s
+
+    ref_rate: float | None = None
+    try:
+        from tokenizers import Tokenizer as RefTokenizer
+
+        ref = RefTokenizer.from_file(str(model_dir / "tokenizer.json"))
+        t2 = time.perf_counter()
+        ref_tokens = sum(len(ref.encode(text).ids) for text in corpus)
+        ref_s = time.perf_counter() - t2
+        ref_rate = ref_tokens / ref_s
+        assert ref_tokens == total_tokens, "token counts diverged from the reference"
+    except ImportError:
+        pass
+
+    peak = peak_rss_bytes()
+    print(f"  strings           {len(corpus):,}")
+    print(f"  characters        {total_chars:,}")
+    print(f"  tokens            {total_tokens:,}")
+    print(f"  chars per token   {total_chars / total_tokens:8.2f}")
+    print(f"  tokenizer load    {load_s:8.3f} s")
+    print(f"  encode            {encode_s:8.3f} s")
+    print(f"  throughput        {ours:12,.0f} tok/s  (pure Python)")
+    if ref_rate:
+        print(f"  reference         {ref_rate:12,.0f} tok/s  (Rust)")
+        print(f"  ratio             {ref_rate / ours:8.1f}x slower than reference")
+    print(f"  peak RSS          {peak / 1e6:8.1f} MB" if peak else "  peak RSS          n/a")
+
+    return Result(
+        phase=args.phase,
+        scenario="tokenize",
+        timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        git_commit=git_commit(),
+        notes=(
+            f"{len(corpus):,} strings, {total_tokens:,} tokens, "
+            f"{'%.1fx slower than reference' % (ref_rate / ours) if ref_rate else 'no reference'}"
+        ),
+        load_s=round(load_s, 4),
+        tokenizer_tok_s=round(ours, 1),
+        reference_tok_s=round(ref_rate, 1) if ref_rate else None,
+        tokens_generated=total_tokens,
+        peak_rss_mb=round(peak / 1e6, 1) if peak else None,
+    )
+
+
 def scenario_generate(args: argparse.Namespace) -> Result:
     """Measure prefill and decode throughput.
 
@@ -153,6 +232,7 @@ def scenario_generate(args: argparse.Namespace) -> Result:
 
 SCENARIOS: dict[str, Scenario] = {
     "load": scenario_load,
+    "tokenize": scenario_tokenize,
     "generate": scenario_generate,
 }
 
@@ -170,7 +250,8 @@ def compare() -> int:
         print("no results recorded yet")
         return 1
 
-    headers = ["phase", "scenario", "quant", "load_s", "ttft_ms", "tok/s", "peak MB", "commit", "when"]
+    headers = ["phase", "scenario", "quant", "load_s", "ttft_ms", "gen tok/s",
+               "tokenizer tok/s", "ref tok/s", "peak MB", "commit", "when"]
     table = []
     for r in rows:
         table.append([
@@ -180,6 +261,8 @@ def compare() -> int:
             _fmt(r.get("load_s"), "{:.2f}"),
             _fmt(r.get("ttft_ms"), "{:.1f}"),
             _fmt(r.get("decode_tok_s"), "{:.2f}"),
+            _fmt(r.get("tokenizer_tok_s"), "{:,.0f}"),
+            _fmt(r.get("reference_tok_s"), "{:,.0f}"),
             _fmt(r.get("peak_rss_mb"), "{:.0f}"),
             r.get("git_commit", ""),
             (r.get("timestamp") or "")[:16].replace("T", " "),
