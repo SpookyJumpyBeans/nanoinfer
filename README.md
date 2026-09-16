@@ -18,8 +18,8 @@ The engine's entire runtime dependency list is `numpy`.
 |------:|------|-------|
 | 1 | Parse safetensors, verify every tensor against the config | **done** |
 | 2 | BPE tokenizer, exact round-trip vs. the reference on 10k strings | **done** |
-| 3 | float32 forward pass, no cache, greedy; logits within 1e-3 of reference | next |
-| 4 | KV cache; bit-identical output, measured speedup | |
+| 3 | float32 forward pass, no cache, greedy; logits within 1e-3 of reference | **done** |
+| 4 | KV cache; bit-identical output, measured speedup | next |
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | |
 | 7 | Rust port: CPU SIMD, then WebGPU compute kernels | |
@@ -89,7 +89,33 @@ The corpus averages 1.97 characters per token, which is far below the ~3.5–4 o
 natural English. That is the corpus doing its job — a third of it is random
 codepoints, control bytes and punctuation runs, which is where tokenizers break.
 
-Tokens/sec, perplexity, and the llama.cpp comparison land in phases 3–8.
+### Phase 3 — forward pass
+
+Correctness, against `transformers` on the real 494M weights:
+
+| Metric | Value |
+|---|---|
+| Max absolute logit difference | **6.2e-05** (gate: 1e-3) |
+| Argmax agreement | every position, every prompt |
+| Generated text vs. reference | token-for-token identical |
+| Per-layer drift | flat at ~5e-4 across all 24 layers |
+
+Speed, with no KV cache at all:
+
+| Metric | Value |
+|---|---|
+| Model load | 2.9 s |
+| Time to first token (5-token prompt) | 3,381 ms |
+| Decode | **0.25 tok/s** |
+| Last token vs. first | 1.26× slower |
+| Peak RSS | 3,607 MB |
+
+That 0.25 tok/s is not a disappointing result, it is the baseline. Every step
+re-embeds and re-attends over the entire sequence, so the 24th token costs
+noticeably more than the first — the 1.26× above is the quadratic cost becoming
+visible over just 24 tokens. Phase 4 exists to delete that.
+
+Perplexity and the llama.cpp comparison land in phases 6–8.
 
 ## Parameter budget
 
@@ -196,9 +222,88 @@ ChatML formatting is checked the same way — by rendering the model's real Jinj
 asserting against hand-written expected output.
 
 ```
-python -m pytest                      # 418 tests
 python -m bench.benchmark tokenize    # throughput vs the Rust reference
 ```
+
+## The forward pass
+
+Twenty-four identical blocks, each with two residual branches:
+
+```python
+x = x + attention(rms_norm(x))
+x = x + feed_forward(rms_norm(x))
+```
+
+The norm sits *inside* the residual branch, not around it. That is "pre-norm",
+and it leaves a path from the embedding to the output that no normalization
+ever touches — which is what makes deep transformers trainable, and at
+inference means the residual stream accumulates rather than being rescaled 48
+times.
+
+| | |
+|---|---|
+| [`ops.py`](nanoinfer/ops.py) | RMSNorm, SiLU, softmax, GQA head expansion, causal mask |
+| [`rope.py`](nanoinfer/rope.py) | rotary position embeddings |
+| [`weights.py`](nanoinfer/weights.py) | typed weight loading, shape-checked against the config |
+| [`attention.py`](nanoinfer/attention.py) | grouped-query self-attention |
+| [`model.py`](nanoinfer/model.py) | SwiGLU, the block, the full pass |
+| [`generate.py`](nanoinfer/generate.py) | the greedy decode loop |
+
+### Every bug here is silent
+
+Nothing in attention fails loudly. Wrong RoPE convention, mask off by one, KV
+heads tiled instead of repeated, a reshape that splits the sequence across
+heads — each produces correctly-shaped finite numbers and text that still reads
+like English. So each is pinned by a test that compares against a *different*
+implementation rather than a restatement of the same steps.
+
+**RoPE has two incompatible conventions.** Half-split (GPT-NeoX, HuggingFace,
+Qwen2) pairs component `i` with `i + d/2`; interleaved (GPT-J, llama.cpp's
+layout) pairs `2i` with `2i+1`. Both produce plausible numbers from the same
+weights. A model on the wrong one emits grammatical text that degrades with
+distance instead of failing. So the interleaved rotation is *also* implemented,
+purely so a test can assert the two genuinely differ and that the wrong one
+does not blow up.
+
+**Grouped-query expansion must repeat, not tile.** 14 query heads share 2 KV
+heads, and KV head 0 must serve query heads 0–6, not 0, 2, 4… `np.tile` gives
+the identical shape with every query head paired to the wrong key.
+
+**The causal mask boundary is `j <= i`.** A token must attend to itself.
+
+### Verification
+
+The gate is every logit at every position within 1e-3 of the reference, on six
+prompts covering English, code, digit runs, CJK and a ChatML turn. Observed
+worst case is 6.2e-05, so it passes with nearly two orders of magnitude to
+spare.
+
+Divergence is located **per layer**, not just reported at the end — a drift
+starting in layer 0 and one starting in layer 19 are different bugs. Measured
+drift is flat at ~5e-4 across all 24 layers, so what accumulates is float32
+round-off rather than a defect, and the test fails if it ever grows abruptly.
+
+### Two things that cost real time
+
+**`do_sample=False` is not greedy.** Qwen2.5 ships a `generation_config.json`
+declaring `repetition_penalty: 1.1`, and `transformers` applies it inside
+`generate()` regardless. The obvious baseline therefore quietly downweights
+tokens already in the context. Ours and the reference agree for three tokens
+and then part company — "It is the largest city" against "It was founded in 7".
+Chasing that as an attention bug is days aimed at the wrong thing.
+
+**`hidden_states[-1]` is after the final norm**, not the last layer's output.
+Comparing a pre-norm state against it reports a divergence of ~150 from
+perfectly correct code.
+
+### There is a floor on "identical"
+
+Asking for the last row's logits alone reshapes the output matmul from
+`[5, 896] @ [896, 151936]` to `[1, 896] @ …`. BLAS picks different blocking,
+which changes the order 896 products are summed in, and float addition is not
+associative — so the results differ by ~1e-5 on logits reaching 19. Phase 4
+will claim the KV cache reproduces the uncached path exactly; that claim has to
+be made at this tolerance, not at zero.
 
 ## Two things about Qwen2.5 that will break a naive implementation
 
@@ -228,14 +333,22 @@ nanoinfer/
   bpe.py              the merge loop
   tokenizer.py        encode / decode / added tokens
   chat.py             ChatML prompt formatting
+  ops.py              RMSNorm, SiLU, softmax, GQA expansion, causal mask
+  rope.py             rotary position embeddings
+  weights.py          typed, shape-checked weight loading
+  attention.py        grouped-query self-attention
+  model.py            SwiGLU, the block, the forward pass
+  generate.py         greedy decoding
 tools/
   download_model.py   four HTTPS GETs, no huggingface_hub
   inspect_weights.py  phase 1: prove every tensor is understood
+  generate.py         run the model from the command line
 bench/
   benchmark.py        append-only measurement harness
   results.jsonl       every number ever recorded
 tests/
   corpus.py           the seeded 10,000-string differential corpus
+  tiny.py             a 4,000-parameter model built on the fly for tests
 ```
 
 ## Running it
@@ -248,8 +361,16 @@ python -m tools.download_model                      # ~950 MB
 python -m tools.inspect_weights models/Qwen2.5-0.5B-Instruct
 python -m bench.benchmark load
 python -m bench.benchmark tokenize
+python -m bench.benchmark generate
 python -m bench.benchmark --compare
-python -m pytest
+python -m pytest                                    # 549 tests
+```
+
+Run the model:
+
+```bash
+python -m tools.generate --prompt "The capital of France is" --max-tokens 20
+python -m tools.generate --chat "Explain RoPE in one sentence."
 ```
 
 `tools.inspect_weights` builds the complete expected tensor manifest from

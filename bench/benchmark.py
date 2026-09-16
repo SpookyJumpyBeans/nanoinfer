@@ -37,6 +37,8 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np  # noqa: E402
+
 from nanoinfer.config import ModelConfig  # noqa: E402
 from nanoinfer.metrics import machine_fingerprint, peak_rss_bytes  # noqa: E402
 from nanoinfer.safetensors import SafeTensors  # noqa: E402
@@ -219,14 +221,77 @@ def scenario_tokenize(args: argparse.Namespace) -> Result:
 
 
 def scenario_generate(args: argparse.Namespace) -> Result:
-    """Measure prefill and decode throughput.
+    """Measure prefill and decode throughput on a real generation.
 
-    Not implemented until phase 3 produces a forward pass. It is declared now
-    so the harness shape is fixed and later phases only fill in the body.
+    The two halves are reported separately because they are different
+    problems. Prefill runs the whole prompt through in one pass: compute-bound,
+    parallel across positions, and it sets time-to-first-token. Decode produces
+    one token at a time, reading every weight in the model to do it, so it is
+    bound by memory bandwidth rather than arithmetic.
+
+    Without a KV cache, decode also gets *slower* as it goes, because every
+    step re-attends over a sequence one token longer than the last. The
+    per-token timings below make that visible rather than averaging it away --
+    it is the specific behaviour phase 4 exists to remove.
     """
-    raise SystemExit(
-        "scenario 'generate' needs a forward pass (phase 3). "
-        "Run 'load' until then."
+    from nanoinfer.generate import greedy_stream
+    from nanoinfer.model import Qwen2
+
+    model_dir = Path(args.model)
+
+    t0 = time.perf_counter()
+    tokenizer = Tokenizer.from_model_dir(model_dir)
+    model = Qwen2.from_model_dir(model_dir)
+    load_s = time.perf_counter() - t0
+
+    prompt_ids = tokenizer.encode(args.prompt)
+    if not prompt_ids:
+        raise SystemExit("prompt encoded to zero tokens")
+
+    t1 = time.perf_counter()
+    model.next_token_logits(np.array(prompt_ids))
+    prefill_s = time.perf_counter() - t1
+
+    per_token: list[float] = []
+    generated: list[int] = []
+    last = time.perf_counter()
+    for token_id in greedy_stream(model, prompt_ids, max_new_tokens=args.tokens):
+        now = time.perf_counter()
+        per_token.append(now - last)
+        last = now
+        generated.append(token_id)
+
+    decode_s = sum(per_token)
+    decode_rate = len(generated) / decode_s if decode_s else 0.0
+    peak = peak_rss_bytes()
+
+    print(f"  prompt            {len(prompt_ids)} tokens: {args.prompt!r}")
+    print(f"  generated         {len(generated)} tokens")
+    print(f"  completion        {tokenizer.decode(generated)!r}")
+    print(f"  model load        {load_s:8.2f} s")
+    print(f"  prefill (ttft)    {prefill_s * 1000:8.0f} ms   "
+          f"({len(prompt_ids) / prefill_s:,.1f} tok/s)")
+    print(f"  decode            {decode_rate:8.2f} tok/s")
+    if len(per_token) >= 2:
+        print(f"  first token       {per_token[0] * 1000:8.0f} ms")
+        print(f"  last token        {per_token[-1] * 1000:8.0f} ms   "
+              f"({per_token[-1] / per_token[0]:.2f}x the first)")
+    print(f"  peak RSS          {peak / 1e6:8.1f} MB" if peak else "  peak RSS          n/a")
+
+    return Result(
+        phase=args.phase,
+        scenario="generate",
+        timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        git_commit=git_commit(),
+        notes=(
+            f"{len(prompt_ids)} prompt + {len(generated)} generated, "
+            f"no kv cache, fp32"
+        ),
+        load_s=round(load_s, 4),
+        ttft_ms=round(prefill_s * 1000, 1),
+        decode_tok_s=round(decode_rate, 4),
+        tokens_generated=len(generated),
+        peak_rss_mb=round(peak / 1e6, 1) if peak else None,
     )
 
 
