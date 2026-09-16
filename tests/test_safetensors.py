@@ -15,41 +15,9 @@ import numpy as np
 import pytest
 
 from nanoinfer.safetensors import SafeTensors, bf16_to_f32, f32_to_bf16
+from tests.tiny import write_safetensors
 
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "Qwen2.5-0.5B-Instruct"
-
-
-def write_safetensors(path: Path, tensors: dict[str, np.ndarray], metadata: dict | None = None) -> Path:
-    """Build a minimal safetensors file by hand, to test the reader against."""
-    dtype_names = {
-        np.dtype("<f4"): "F32",
-        np.dtype("<f8"): "F64",
-        np.dtype("<i4"): "I32",
-        np.dtype("<i8"): "I64",
-        np.dtype("<u2"): "BF16",
-        np.dtype(np.int8): "I8",
-        np.dtype(np.uint8): "U8",
-        np.dtype(np.bool_): "BOOL",
-    }
-
-    header: dict = {}
-    if metadata:
-        header["__metadata__"] = metadata
-
-    blob = bytearray()
-    for name, arr in tensors.items():
-        arr = np.ascontiguousarray(arr)
-        begin = len(blob)
-        blob.extend(arr.tobytes())
-        header[name] = {
-            "dtype": dtype_names[arr.dtype],
-            "shape": list(arr.shape),
-            "data_offsets": [begin, len(blob)],
-        }
-
-    header_bytes = json.dumps(header).encode("utf-8")
-    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + bytes(blob))
-    return path
 
 
 # -- bfloat16 --------------------------------------------------------------
