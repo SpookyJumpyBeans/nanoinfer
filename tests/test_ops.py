@@ -270,3 +270,70 @@ def test_causal_mask_matches_torch_triu():
 
 def test_causal_mask_of_length_one():
     np.testing.assert_array_equal(causal_mask(1), np.zeros((1, 1), dtype=np.float32))
+
+
+# -- causal_mask with a cached prefix --------------------------------------
+
+
+def test_cached_mask_shape():
+    """One row per new token, one column per key: cached first, then new."""
+    assert causal_mask(3, cached_len=5).shape == (3, 8)
+
+
+def test_cached_columns_are_always_permitted():
+    """Everything already in the cache is by construction in the past."""
+    mask = causal_mask(4, cached_len=6)
+    assert np.all(mask[:, :6] == 0.0)
+
+
+def test_cached_mask_is_triangular_only_on_the_new_block():
+    mask = causal_mask(4, cached_len=6)
+    new_block = mask[:, 6:]
+    np.testing.assert_array_equal(new_block, causal_mask(4))
+
+
+def test_cached_mask_follows_absolute_positions():
+    """New token i sits at absolute position cached_len + i."""
+    cached, new = 3, 4
+    mask = causal_mask(new, cached_len=cached)
+    for i in range(new):
+        for j in range(cached + new):
+            permitted = j <= cached + i
+            assert (mask[i, j] == 0.0) == permitted, (i, j)
+
+
+def test_decode_step_masks_nothing():
+    """The single-token case: attend to the whole cache and to itself.
+
+    A decode path that still applies a square triangular mask here would be
+    masking its one row against the wrong axis.
+    """
+    mask = causal_mask(1, cached_len=9)
+    assert mask.shape == (1, 10)
+    assert np.all(mask == 0.0)
+
+
+def test_zero_cache_reproduces_the_plain_mask():
+    """The uncached path must be exactly the phase 3 behaviour."""
+    for n in (1, 2, 5, 9):
+        np.testing.assert_array_equal(causal_mask(n, cached_len=0), causal_mask(n))
+
+
+def test_mask_is_consistent_when_split_across_steps():
+    """Prefill of 6, then a decode step, must equal a single pass over 7.
+
+    Row 6 of the one-shot mask and the row produced by the decode step have to
+    permit exactly the same columns, or the cache changes the arithmetic.
+    """
+    one_shot = causal_mask(7)
+    stepwise = causal_mask(1, cached_len=6)
+    np.testing.assert_array_equal(stepwise[0], one_shot[6])
+
+
+def test_cached_mask_rejects_negative_lengths():
+    with pytest.raises(ValueError, match="non-negative"):
+        causal_mask(3, cached_len=-1)
+
+
+def test_empty_new_tokens_gives_an_empty_mask():
+    assert causal_mask(0, cached_len=4).shape == (0, 4)

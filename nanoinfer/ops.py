@@ -125,16 +125,41 @@ def repeat_kv(x: np.ndarray, repeats: int) -> np.ndarray:
     return np.repeat(x, repeats, axis=0)
 
 
-def causal_mask(seq_len: int, dtype: np.dtype = np.float32) -> np.ndarray:
-    """An additive mask that forbids attending to future positions.
+def causal_mask(
+    seq_len: int, cached_len: int = 0, dtype: np.dtype = np.float32
+) -> np.ndarray:
+    """An additive mask forbidding attention to future positions.
 
     Additive rather than multiplicative: it is added to the scores before the
     softmax, so blocked positions hold ``-inf`` and permitted ones hold 0.
 
-    The boundary is ``j <= i``, inclusive. Writing ``j < i`` -- forbidding a
-    token from attending to itself -- is the off-by-one the brief warns about,
-    and the model still produces fluent, subtly wrong text if you do.
+    ``cached_len`` is how many earlier tokens already sit in a KV cache. The
+    result is ``[seq_len, cached_len + seq_len]``: one row per *new* token, one
+    column per key available to attend over, cached keys first.
+
+    The rule is the same either way. New token ``i`` occupies absolute position
+    ``cached_len + i``, and may attend to every absolute position up to and
+    including its own::
+
+        mask[i, j] = 0 if j <= cached_len + i else -inf
+
+    Two consequences worth stating, because both are places to get this wrong:
+
+    * Every cached column is permitted for every row. Cached tokens are by
+      construction in the past, so the left ``cached_len`` columns are always
+      zero and only the square right-hand block is triangular.
+    * With ``seq_len == 1`` -- the decode step -- nothing is masked at all. The
+      single new token attends to the whole cache and to itself. A decode path
+      that still applies a square triangular mask here is masking the one row
+      it has against the wrong axis.
+
+    The boundary is ``j <= i``, inclusive. Writing ``j < i`` forbids a token
+    from attending to itself, and the model still produces fluent, subtly
+    wrong text if you do.
     """
-    mask = np.zeros((seq_len, seq_len), dtype=dtype)
-    mask[np.triu_indices(seq_len, k=1)] = -np.inf
-    return mask
+    if seq_len < 0 or cached_len < 0:
+        raise ValueError(f"lengths must be non-negative, got {seq_len}, {cached_len}")
+
+    rows = np.arange(seq_len)[:, None]
+    cols = np.arange(cached_len + seq_len)[None, :]
+    return np.where(cols <= cached_len + rows, 0.0, -np.inf).astype(dtype)
