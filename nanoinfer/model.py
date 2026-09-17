@@ -15,11 +15,12 @@ embedding to the final norm that no normalization ever touches. That clean
 residual highway is what makes deep transformers trainable, and at inference it
 means the residual stream accumulates rather than being rescaled at every step.
 
-**There is no cache here at all.** Every call recomputes attention over the
-whole sequence from scratch, which makes generating n tokens O(n³) work in
-total. That is the point: phase 3 is the correctness baseline that phase 4's
-KV cache has to reproduce exactly while being roughly 10x faster. Optimizing
-now would mean optimizing something not yet known to be right.
+**The cache is optional and the code path is shared.** Pass no cache and every
+call recomputes attention over the whole sequence, which is the phase 3
+baseline and makes generating n tokens O(n³) work in total. Pass one and each
+call processes only the tokens not already stored. There is deliberately no
+separate "cached forward pass": the claim being made is that the two compute
+the same function, and that is only checkable if there is one function.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import numpy as np
 
 from nanoinfer.attention import self_attention
 from nanoinfer.config import ModelConfig
+from nanoinfer.kvcache import KVCache
 from nanoinfer.ops import rms_norm, silu
 from nanoinfer.rope import RotaryEmbedding
 from nanoinfer.weights import LayerWeights, ModelWeights
@@ -57,10 +59,21 @@ def transformer_block(
     config: ModelConfig,
     rope: RotaryEmbedding,
     positions: np.ndarray,
+    cache: KVCache | None = None,
+    layer_index: int | None = None,
 ) -> np.ndarray:
-    """One decoder layer: pre-norm attention, then pre-norm feed-forward."""
+    """One decoder layer: pre-norm attention, then pre-norm feed-forward.
+
+    Only attention touches the cache. The feed-forward block is applied
+    position by position with no interaction between them, so there is nothing
+    about it worth storing -- which is also why it gets no faster when the
+    cache arrives, and why it dominates the decode step once attention stops
+    being quadratic.
+    """
     normed = rms_norm(hidden, layer.input_layernorm, config.rms_norm_eps)
-    hidden = hidden + self_attention(normed, layer, config, rope, positions)
+    hidden = hidden + self_attention(
+        normed, layer, config, rope, positions, cache=cache, layer_index=layer_index
+    )
 
     normed = rms_norm(hidden, layer.post_attention_layernorm, config.rms_norm_eps)
     hidden = hidden + feed_forward(normed, layer)
@@ -108,16 +121,46 @@ class Qwen2:
 
         return self.weights.embed_tokens[token_ids]
 
-    def hidden_states(
-        self, token_ids: np.ndarray, positions: np.ndarray | None = None
-    ) -> np.ndarray:
-        """Run the blocks and the final norm, returning ``[seq, hidden]``."""
-        hidden = self.embed(token_ids)
-        if positions is None:
-            positions = np.arange(hidden.shape[0])
+    def new_cache(self, capacity: int) -> KVCache:
+        """Allocate a cache sized for this model and a given sequence length."""
+        return KVCache(self.config, capacity)
 
-        for layer in self.weights.layers:
-            hidden = transformer_block(hidden, layer, self.config, self.rope, positions)
+    def hidden_states(
+        self,
+        token_ids: np.ndarray,
+        positions: np.ndarray | None = None,
+        cache: KVCache | None = None,
+    ) -> np.ndarray:
+        """Run the blocks and the final norm, returning ``[n_new, hidden]``.
+
+        With a cache, ``token_ids`` is only the tokens not already stored, and
+        the result has one row per *new* token rather than per sequence
+        position.
+
+        The watermark is advanced once here, after the layer loop, rather than
+        inside it. Every layer stores the same tokens at the same offset, so a
+        layer advancing it would put the next layer's keys in the wrong slots.
+        """
+        hidden = self.embed(token_ids)
+        n_new = hidden.shape[0]
+
+        cached_len = cache.length if cache is not None else 0
+        if positions is None:
+            positions = np.arange(cached_len, cached_len + n_new)
+
+        for index, layer in enumerate(self.weights.layers):
+            hidden = transformer_block(
+                hidden,
+                layer,
+                self.config,
+                self.rope,
+                positions,
+                cache=cache,
+                layer_index=index if cache is not None else None,
+            )
+
+        if cache is not None:
+            cache.commit(n_new)
 
         return rms_norm(hidden, self.weights.final_norm, self.config.rms_norm_eps)
 
@@ -126,6 +169,7 @@ class Qwen2:
         token_ids: np.ndarray,
         positions: np.ndarray | None = None,
         last_only: bool = False,
+        cache: KVCache | None = None,
     ) -> np.ndarray:
         """Logits for the sequence, shaped ``[seq, vocab]``.
 
@@ -136,13 +180,19 @@ class Qwen2:
         single most expensive operation in the whole pass, and generation only
         ever needs its last row.
         """
-        hidden = self.hidden_states(token_ids, positions)
+        hidden = self.hidden_states(token_ids, positions, cache=cache)
         if last_only:
             hidden = hidden[-1:]
 
         # Tied embeddings: this is embed_tokens again, used transposed.
         return hidden @ self.weights.lm_head.T
 
-    def next_token_logits(self, token_ids: np.ndarray) -> np.ndarray:
-        """Logits for the token that would come next, shaped ``[vocab]``."""
-        return self.forward(token_ids, last_only=True)[0]
+    def next_token_logits(
+        self, token_ids: np.ndarray, cache: KVCache | None = None
+    ) -> np.ndarray:
+        """Logits for the token that would come next, shaped ``[vocab]``.
+
+        With a cache, ``token_ids`` is the tokens not yet stored: the whole
+        prompt on the first call, then one token per step.
+        """
+        return self.forward(token_ids, last_only=True, cache=cache)[0]
