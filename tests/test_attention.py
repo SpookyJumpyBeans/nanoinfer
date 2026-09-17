@@ -273,3 +273,148 @@ def test_changing_the_spacing_between_positions_does_change_the_result(tiny, rop
     )
 
     assert not np.allclose(adjacent, spread)
+
+
+# -- with a KV cache -------------------------------------------------------
+
+
+@pytest.fixture
+def cache(tiny):
+    from nanoinfer.kvcache import KVCache
+
+    return KVCache(tiny.config, capacity=32)
+
+
+def run_cached(tiny, rope, cache, hidden, chunks):
+    """Feed `hidden` through attention in the given chunk sizes, using a cache."""
+    outputs = []
+    start = 0
+    for size in chunks:
+        piece = hidden[start : start + size]
+        outputs.append(
+            self_attention(piece, tiny.layers[0], tiny.config, rope, cache=cache, layer_index=0)
+        )
+        # Only layer 0 exists in this test, so the other layers are marked
+        # written by hand; the model drives every layer for real.
+        for other in range(1, tiny.config.num_hidden_layers):
+            zeros = np.zeros(
+                (tiny.config.num_key_value_heads, size, tiny.config.head_dim),
+                dtype=np.float32,
+            )
+            cache.extend(other, zeros, zeros)
+        cache.commit(size)
+        start += size
+    return np.concatenate(outputs, axis=0)
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [8],                       # prefill only
+        [1] * 8,                   # pure token-at-a-time
+        [5, 1, 1, 1],              # prompt then decode: the real pattern
+        [4, 4],                    # two equal chunks
+        [1, 3, 1, 2, 1],           # ragged
+    ],
+    ids=["prefill", "one_at_a_time", "prompt_then_decode", "halves", "ragged"],
+)
+def test_cached_matches_uncached(tiny, rope, cache, chunks):
+    """The claim phase 4 rests on: the cache changes cost, not arithmetic.
+
+    Split the same 8 tokens across every chunking pattern and the result must
+    match a single uncached pass. Chunk shape is what exercises the mask and
+    the position offsets, which is where a cache goes wrong.
+    """
+    hidden = np.random.default_rng(20).standard_normal(
+        (8, tiny.config.hidden_size)
+    ).astype(np.float32)
+
+    uncached = self_attention(hidden, tiny.layers[0], tiny.config, rope)
+    cached = run_cached(tiny, rope, cache, hidden, chunks)
+
+    np.testing.assert_allclose(cached, uncached, rtol=1e-5, atol=1e-6)
+
+
+def test_decode_step_sees_the_whole_prompt(tiny, rope, cache):
+    """Token 6's output with a 5-token cache equals its row in a full pass."""
+    hidden = np.random.default_rng(21).standard_normal(
+        (6, tiny.config.hidden_size)
+    ).astype(np.float32)
+
+    full = self_attention(hidden, tiny.layers[0], tiny.config, rope)
+    stepwise = run_cached(tiny, rope, cache, hidden, [5, 1])
+
+    np.testing.assert_allclose(stepwise[5], full[5], rtol=1e-5, atol=1e-6)
+
+
+def test_cache_holds_rotated_keys(tiny, rope, cache):
+    """Keys must be stored after RoPE, so they are never rotated twice."""
+    hidden = np.random.default_rng(22).standard_normal(
+        (3, tiny.config.hidden_size)
+    ).astype(np.float32)
+    layer = tiny.layers[0]
+
+    self_attention(hidden, layer, tiny.config, rope, cache=cache, layer_index=0)
+
+    raw = split_heads(
+        hidden @ layer.k_proj_weight.T + layer.k_proj_bias,
+        tiny.config.num_key_value_heads,
+        tiny.config.head_dim,
+    )
+    rotated = rope.apply(raw, np.arange(3))
+    stored = cache.keys(0) if cache.length else cache._keys[0, :, :3, :]
+
+    np.testing.assert_allclose(stored, rotated, rtol=1e-6, atol=1e-7)
+    assert not np.allclose(stored, raw), "keys appear to have been stored unrotated"
+
+
+def test_positions_continue_past_the_cache(tiny, rope, cache):
+    """A decode token must be rotated at its absolute position, not at zero.
+
+    Rotating every decode token as position 0 is the most likely way to get a
+    cache subtly wrong: output stays fluent and loses all sense of order.
+    """
+    hidden = np.random.default_rng(23).standard_normal(
+        (4, tiny.config.hidden_size)
+    ).astype(np.float32)
+
+    correct = run_cached(tiny, rope, cache, hidden, [3, 1])
+
+    cache.reset()
+    outputs = []
+    outputs.append(
+        self_attention(hidden[:3], tiny.layers[0], tiny.config, rope, cache=cache, layer_index=0)
+    )
+    for other in range(1, tiny.config.num_hidden_layers):
+        z = np.zeros((tiny.config.num_key_value_heads, 3, tiny.config.head_dim), np.float32)
+        cache.extend(other, z, z)
+    cache.commit(3)
+    # The bug: position 0 instead of position 3.
+    outputs.append(
+        self_attention(
+            hidden[3:], tiny.layers[0], tiny.config, rope,
+            positions=np.array([0]), cache=cache, layer_index=0,
+        )
+    )
+    wrong = np.concatenate(outputs, axis=0)
+
+    assert np.all(np.isfinite(wrong)), "the bug produces valid numbers"
+    assert not np.allclose(correct[3], wrong[3]), "and a different answer"
+
+
+def test_cache_requires_a_layer_index(tiny, rope, cache):
+    hidden = np.zeros((2, tiny.config.hidden_size), dtype=np.float32)
+    with pytest.raises(ValueError, match="layer_index is required"):
+        self_attention(hidden, tiny.layers[0], tiny.config, rope, cache=cache)
+
+
+def test_uncached_path_is_unchanged(tiny, rope):
+    """Passing no cache must behave exactly as it did in phase 3."""
+    hidden = np.random.default_rng(24).standard_normal(
+        (5, tiny.config.hidden_size)
+    ).astype(np.float32)
+    explicit = self_attention(
+        hidden, tiny.layers[0], tiny.config, rope, positions=np.arange(5)
+    )
+    default = self_attention(hidden, tiny.layers[0], tiny.config, rope)
+    np.testing.assert_array_equal(explicit, default)

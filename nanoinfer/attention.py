@@ -28,6 +28,7 @@ from __future__ import annotations
 import numpy as np
 
 from nanoinfer.config import ModelConfig
+from nanoinfer.kvcache import KVCache
 from nanoinfer.ops import causal_mask, repeat_kv, softmax
 from nanoinfer.rope import RotaryEmbedding
 from nanoinfer.weights import LayerWeights
@@ -58,16 +59,32 @@ def self_attention(
     config: ModelConfig,
     rope: RotaryEmbedding,
     positions: np.ndarray | None = None,
+    cache: KVCache | None = None,
+    layer_index: int | None = None,
 ) -> np.ndarray:
-    """One grouped-query self-attention block.
+    """One grouped-query self-attention block, with or without a KV cache.
 
-    ``hidden`` is ``[seq, hidden_size]`` and the result has the same shape.
-    ``positions`` defaults to ``0..seq-1``; it is a parameter because phase 4's
-    KV cache will pass a single position partway through a sequence.
+    ``hidden`` is ``[n_new, hidden_size]`` and the result has the same shape.
+    Without a cache, ``n_new`` is the whole sequence. With one, it is only the
+    tokens not yet seen -- the whole prompt on the first call, then one token
+    per decode step.
+
+    Deliberately one function rather than a cached and an uncached variant.
+    Two implementations of attention would drift, and the entire claim of
+    phase 4 is that the cached path computes the identical function; that is
+    far easier to believe when there is only one path to read.
+
+    ``positions`` defaults to the ``n_new`` absolute positions following
+    whatever is already cached. Defaulting it to ``0..n_new-1`` instead would
+    rotate every decode token as though it were at position zero, which is the
+    single most likely way to get a cache subtly wrong: output stays fluent and
+    loses all sense of order beyond the prompt.
     """
     seq = hidden.shape[0]
+    cached_len = cache.length if cache is not None else 0
+
     if positions is None:
-        positions = np.arange(seq)
+        positions = np.arange(cached_len, cached_len + seq)
 
     n_heads = config.num_attention_heads
     n_kv = config.num_key_value_heads
@@ -88,6 +105,18 @@ def self_attention(
     q = rope.apply(q, positions)
     k = rope.apply(k, positions)
 
+    # Store the rotated keys and values, and get back everything so far.
+    #
+    # Rotation happens before the cache, never after. A token's position never
+    # changes, so rotating once on insert is both correct and cheaper than
+    # re-rotating the whole history each step. Rotating again on read would
+    # apply the rotation twice to every cached key -- fluent output, scrambled
+    # sense of order.
+    if cache is not None:
+        if layer_index is None:
+            raise ValueError("layer_index is required when a cache is given")
+        k, v = cache.extend(layer_index, k, v)
+
     # Broadcast the narrow KV heads out to match the query heads. Consecutive,
     # not interleaved -- see repeat_kv.
     k = repeat_kv(k, config.kv_group_size)
@@ -99,8 +128,10 @@ def self_attention(
     # a single position.
     scores = q @ k.transpose(0, 2, 1) * np.float32(head_dim**-0.5)
 
-    # The mask is [seq, seq] and broadcasts across heads.
-    scores = scores + causal_mask(seq, dtype=scores.dtype)
+    # The mask is [n_new, cached + n_new] and broadcasts across heads. With a
+    # full cache and one new token it is all zeros: the new token may attend
+    # everywhere, because everything stored is already in its past.
+    scores = scores + causal_mask(seq, cached_len, dtype=scores.dtype)
 
     weights = softmax(scores, axis=-1)
     context = weights @ v
