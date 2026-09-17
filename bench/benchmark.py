@@ -14,8 +14,9 @@ Metrics, and why each one:
                   it. Published even though we lose badly; that gap is the
                   thing phase 7 has to close.
   ttft_ms         Time to first token: how long the prefill pass takes.
-  decode_tok_s    Steady-state tokens per second after the first token. The
-                  headline number, and the one the KV cache moves.
+  decode_tok_s    Steady-state tokens per second, excluding the first token
+                  whose cost is dominated by the prompt. The headline
+                  number, and the one the KV cache moves.
   peak_rss_mb     Peak resident memory. Decides whether the model fits.
 
 Run:
@@ -62,6 +63,7 @@ class Result:
     tokenizer_tok_s: float | None = None
     reference_tok_s: float | None = None
     tokens_generated: int | None = None
+    kv_cache: bool | None = None
     peak_rss_mb: float | None = None
     quantization: str = "none"
     machine: dict[str, Any] = field(default_factory=machine_fingerprint)
@@ -223,17 +225,136 @@ def scenario_tokenize(args: argparse.Namespace) -> Result:
 def scenario_generate(args: argparse.Namespace) -> Result:
     """Measure prefill and decode throughput on a real generation.
 
-    The two halves are reported separately because they are different
-    problems. Prefill runs the whole prompt through in one pass: compute-bound,
-    parallel across positions, and it sets time-to-first-token. Decode produces
-    one token at a time, reading every weight in the model to do it, so it is
-    bound by memory bandwidth rather than arithmetic.
+    The two halves are different problems and are never averaged together.
+    Time-to-first-token covers the whole prompt: compute-bound, parallel across
+    positions, and what a user experiences as latency. Decode is the
+    steady-state rate afterwards, bound by memory bandwidth because every
+    weight in the model is read to produce one token.
 
-    Without a KV cache, decode also gets *slower* as it goes, because every
-    step re-attends over a sequence one token longer than the last. The
-    per-token timings below make that visible rather than averaging it away --
-    it is the specific behaviour phase 4 exists to remove.
+    **Reported statistics are medians and minima, not means.** This machine
+    produces occasional multi-second stalls under sustained load -- the same
+    matmul measured twice a minute apart can differ by two orders of magnitude,
+    at no consistent size. A mean over a run containing one such stall is
+    meaningless, and a single measurement is a coin flip. So the whole
+    generation is repeated, the fastest run is taken for totals, and per-token
+    cost is reported as a median with the spread alongside it so the noise is
+    visible rather than hidden.
+
+    Pass --no-cache to measure the phase 3 path on the same prompt.
     """
+    import statistics
+
+    from nanoinfer.generate import greedy_stream
+    from nanoinfer.model import Qwen2
+
+    model_dir = Path(args.model)
+    use_cache = not args.no_cache
+
+    t0 = time.perf_counter()
+    tokenizer = Tokenizer.from_model_dir(model_dir)
+    model = Qwen2.from_model_dir(model_dir)
+    load_s = time.perf_counter() - t0
+
+    prompt_ids = tokenizer.encode(args.prompt)
+    if not prompt_ids:
+        raise SystemExit("prompt encoded to zero tokens")
+
+    # Warm the weights and the BLAS thread pool. Without this the first
+    # measured step also pays for paging 2 GB off disk -- a real cost, but one
+    # that belongs to the 'load' scenario rather than to decode throughput.
+    model.next_token_logits(np.array(prompt_ids))
+
+    runs: list[list[float]] = []
+    generated: list[int] = []
+    for _ in range(args.repeat):
+        cache = model.new_cache(len(prompt_ids) + args.tokens) if use_cache else None
+        per_token: list[float] = []
+        produced: list[int] = []
+        last = time.perf_counter()
+        for token_id in greedy_stream(
+            model, prompt_ids, max_new_tokens=args.tokens, cache=cache
+        ):
+            now = time.perf_counter()
+            per_token.append(now - last)
+            last = now
+            produced.append(token_id)
+        runs.append(per_token)
+        if generated and produced != generated:
+            raise SystemExit("generation was not deterministic across repeats")
+        generated = produced
+
+    totals = [sum(r) for r in runs]
+    best = runs[totals.index(min(totals))]
+
+    ttft_s = min(r[0] for r in runs)
+    steady = [t for r in runs for t in r[1:]]
+    median_step = statistics.median(steady)
+    decode_rate = 1.0 / median_step if median_step else 0.0
+
+    print(f"  kv cache          {'on' if use_cache else 'off'}")
+    print(f"  prompt            {len(prompt_ids)} tokens: {args.prompt!r}")
+    print(f"  generated         {len(generated)} tokens x {args.repeat} runs")
+    print(f"  completion        {tokenizer.decode(generated)!r}")
+    print(f"  model load        {load_s:8.2f} s")
+    print(f"  time to first     {ttft_s * 1000:8.0f} ms   (best of {args.repeat})")
+    print(f"  decode            {decode_rate:8.3f} tok/s  (1 / median step)")
+    print(f"  median step       {median_step * 1000:8.1f} ms")
+    if len(steady) >= 4:
+        ordered = sorted(steady)
+        print(f"  fastest step      {ordered[0] * 1000:8.1f} ms")
+        print(f"  p90 step          {ordered[int(0.9 * len(ordered))] * 1000:8.1f} ms")
+        print(f"  slowest step      {ordered[-1] * 1000:8.1f} ms   "
+              f"({ordered[-1] / ordered[0]:.1f}x the fastest -- machine noise)")
+    print(f"  best run total    {min(totals):8.2f} s")
+    print(f"  worst run total   {max(totals):8.2f} s")
+
+    # Does per-token cost grow with sequence length? Without a cache it must;
+    # with one it must not. Compare the first and last thirds of the best run.
+    if len(best) >= 6:
+        body = best[1:]
+        third = max(1, len(body) // 3)
+        early = statistics.median(body[:third])
+        late = statistics.median(body[-third:])
+        print(f"  growth            {late / early:8.2f}x  "
+              f"(median of last third vs first third)")
+
+    peak = peak_rss_bytes()
+    print(f"  peak RSS          {peak / 1e6:8.1f} MB" if peak else "  peak RSS          n/a")
+
+    return Result(
+        phase=args.phase,
+        scenario="generate",
+        timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        git_commit=git_commit(),
+        notes=(
+            f"{len(prompt_ids)} prompt + {len(generated)} generated, fp32, "
+            f"kv cache {'on' if use_cache else 'off'}, "
+            f"best of {args.repeat}, decode = 1/median step"
+        ),
+        load_s=round(load_s, 4),
+        ttft_ms=round(ttft_s * 1000, 1),
+        decode_tok_s=round(decode_rate, 4),
+        tokens_generated=len(generated),
+        kv_cache=use_cache,
+        peak_rss_mb=round(peak / 1e6, 1) if peak else None,
+    )
+
+
+def scenario_cache_ab(args: argparse.Namespace) -> Result:
+    """Measure cached against uncached by alternating them in one process.
+
+    Two separate benchmark runs are not comparable on this machine. Its
+    throughput drifts by more than the effect being measured -- the same
+    uncached generation has come in at 6.6 s and at 78 s depending on nothing
+    more than when it ran. Running both paths back to back, repeatedly, in one
+    process is the only way the comparison means anything: whatever the machine
+    is doing, it does it to both.
+
+    Both rows are recorded. The generated tokens are asserted identical across
+    every run, so a correctness regression cannot hide inside a timing change.
+    """
+    import statistics
+
     from nanoinfer.generate import greedy_stream
     from nanoinfer.model import Qwen2
 
@@ -245,60 +366,116 @@ def scenario_generate(args: argparse.Namespace) -> Result:
     load_s = time.perf_counter() - t0
 
     prompt_ids = tokenizer.encode(args.prompt)
-    if not prompt_ids:
-        raise SystemExit("prompt encoded to zero tokens")
+    for _ in range(2):
+        model.next_token_logits(np.array(prompt_ids))
 
-    t1 = time.perf_counter()
-    model.next_token_logits(np.array(prompt_ids))
-    prefill_s = time.perf_counter() - t1
+    samples = {
+        "cached": {"steps": [], "ttft": [], "total": []},
+        "uncached": {"steps": [], "ttft": [], "total": []},
+    }
+    produced: dict[str, list[int]] = {}
 
-    per_token: list[float] = []
-    generated: list[int] = []
-    last = time.perf_counter()
-    for token_id in greedy_stream(model, prompt_ids, max_new_tokens=args.tokens):
-        now = time.perf_counter()
-        per_token.append(now - last)
-        last = now
-        generated.append(token_id)
+    for _ in range(args.repeat):
+        for mode in ("cached", "uncached"):
+            cache = (
+                model.new_cache(len(prompt_ids) + args.tokens)
+                if mode == "cached"
+                else None
+            )
+            times: list[float] = []
+            got: list[int] = []
+            last = time.perf_counter()
+            for token_id in greedy_stream(
+                model, prompt_ids, max_new_tokens=args.tokens, cache=cache
+            ):
+                now = time.perf_counter()
+                times.append(now - last)
+                last = now
+                got.append(token_id)
 
-    decode_s = sum(per_token)
-    decode_rate = len(generated) / decode_s if decode_s else 0.0
-    peak = peak_rss_bytes()
+            samples[mode]["ttft"].append(times[0])
+            samples[mode]["steps"].extend(times[1:])
+            samples[mode]["total"].append(sum(times))
+            if mode in produced and produced[mode] != got:
+                raise SystemExit(f"{mode} generation was not deterministic")
+            produced[mode] = got
+
+    if produced["cached"] != produced["uncached"]:
+        raise SystemExit(
+            "CACHED AND UNCACHED DIVERGED"
+            f"\n  cached  : {produced['cached']}"
+            f"\n  uncached: {produced['uncached']}"
+        )
 
     print(f"  prompt            {len(prompt_ids)} tokens: {args.prompt!r}")
-    print(f"  generated         {len(generated)} tokens")
-    print(f"  completion        {tokenizer.decode(generated)!r}")
+    print(f"  generated         {args.tokens} tokens x {args.repeat} rounds each")
+    print(f"  completion        {tokenizer.decode(produced['cached'])!r}")
+    print("  outputs identical across both paths and every round")
     print(f"  model load        {load_s:8.2f} s")
-    print(f"  prefill (ttft)    {prefill_s * 1000:8.0f} ms   "
-          f"({len(prompt_ids) / prefill_s:,.1f} tok/s)")
-    print(f"  decode            {decode_rate:8.2f} tok/s")
-    if len(per_token) >= 2:
-        print(f"  first token       {per_token[0] * 1000:8.0f} ms")
-        print(f"  last token        {per_token[-1] * 1000:8.0f} ms   "
-              f"({per_token[-1] / per_token[0]:.2f}x the first)")
-    print(f"  peak RSS          {peak / 1e6:8.1f} MB" if peak else "  peak RSS          n/a")
+    print()
+    print(f"  {'':10} {'ttft ms':>9} {'median step':>12} {'decode tok/s':>13} {'best total':>11}")
+    medians = {}
+    for mode in ("uncached", "cached"):
+        d = samples[mode]
+        median_step = statistics.median(d["steps"])
+        medians[mode] = median_step
+        print(
+            f"  {mode:10} {min(d['ttft']) * 1000:>9.0f} "
+            f"{median_step * 1000:>11.1f}ms {1 / median_step:>13.3f} "
+            f"{min(d['total']):>10.2f}s"
+        )
 
-    return Result(
-        phase=args.phase,
-        scenario="generate",
-        timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        git_commit=git_commit(),
-        notes=(
-            f"{len(prompt_ids)} prompt + {len(generated)} generated, "
-            f"no kv cache, fp32"
-        ),
-        load_s=round(load_s, 4),
-        ttft_ms=round(prefill_s * 1000, 1),
-        decode_tok_s=round(decode_rate, 4),
-        tokens_generated=len(generated),
-        peak_rss_mb=round(peak / 1e6, 1) if peak else None,
-    )
+    speedup = medians["uncached"] / medians["cached"]
+    positions_uncached = sum(len(prompt_ids) + i for i in range(args.tokens))
+    positions_cached = len(prompt_ids) + args.tokens - 1
+    print()
+    print(f"  decode speedup    {speedup:8.2f}x")
+    print(f"  arithmetic saved  {positions_uncached / positions_cached:8.2f}x  "
+          f"({positions_uncached} positions -> {positions_cached})")
+    print()
+    print("  The speedup is far smaller than the arithmetic saved, and that is")
+    print("  the real finding: decoding one token reads every weight in the")
+    print("  model, so it is bound by memory bandwidth, not by arithmetic.")
+    weights_gb = model.weights.nbytes / 1e9
+    print(f"  {weights_gb:.2f} GB of weights / {medians['cached'] * 1000:.0f} ms per token "
+          f"= {weights_gb / medians['cached']:.0f} GB/s effective.")
+    print("  Reducing bytes read is the only way past this, which is phase 6.")
+
+    peak = peak_rss_bytes()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    commit = git_commit()
+
+    for mode in ("uncached", "cached"):
+        d = samples[mode]
+        record(
+            Result(
+                phase=args.phase,
+                scenario="generate",
+                timestamp=now,
+                git_commit=commit,
+                notes=(
+                    f"{len(prompt_ids)} prompt + {args.tokens} generated, fp32, "
+                    f"kv cache {'on' if mode == 'cached' else 'off'}, "
+                    f"alternating A/B x{args.repeat}, decode = 1/median step"
+                ),
+                load_s=round(load_s, 4),
+                ttft_ms=round(min(d["ttft"]) * 1000, 1),
+                decode_tok_s=round(1 / medians[mode], 4),
+                tokens_generated=args.tokens,
+                kv_cache=mode == "cached",
+                peak_rss_mb=round(peak / 1e6, 1) if peak else None,
+            )
+        )
+
+    # Both rows are already written; returning None tells main() not to record.
+    return None  # type: ignore[return-value]
 
 
 SCENARIOS: dict[str, Scenario] = {
     "load": scenario_load,
     "tokenize": scenario_tokenize,
     "generate": scenario_generate,
+    "cache_ab": scenario_cache_ab,
 }
 
 
@@ -315,7 +492,7 @@ def compare() -> int:
         print("no results recorded yet")
         return 1
 
-    headers = ["phase", "scenario", "quant", "load_s", "ttft_ms", "gen tok/s",
+    headers = ["phase", "scenario", "quant", "kv", "load_s", "ttft_ms", "gen tok/s",
                "tokenizer tok/s", "ref tok/s", "peak MB", "commit", "when"]
     table = []
     for r in rows:
@@ -323,6 +500,7 @@ def compare() -> int:
             r.get("phase", ""),
             r.get("scenario", ""),
             r.get("quantization", ""),
+            {True: "on", False: "off", None: "-"}[r.get("kv_cache")],
             _fmt(r.get("load_s"), "{:.2f}"),
             _fmt(r.get("ttft_ms"), "{:.1f}"),
             _fmt(r.get("decode_tok_s"), "{:.2f}"),
@@ -357,6 +535,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--phase", default="1", help="phase label recorded with the result")
     parser.add_argument("--prompt", default="The capital of France is", help="prompt for generation scenarios")
     parser.add_argument("--tokens", type=int, default=64, help="tokens to generate")
+    parser.add_argument("--repeat", type=int, default=3,
+                        help="repeat the measurement; medians and minima are reported")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="disable the KV cache, measuring the phase 3 path")
     parser.add_argument("--compare", action="store_true", help="print the recorded history and exit")
     parser.add_argument("--dry-run", action="store_true", help="measure but do not record")
     args = parser.parse_args(argv)
@@ -369,6 +551,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"scenario: {args.scenario}   model: {args.model}   phase: {args.phase}")
     print("-" * 60)
     result = SCENARIOS[args.scenario](args)
+    if result is None:
+        return 0          # the scenario recorded its own rows
     if args.dry_run:
         print("\n--dry-run: not recorded")
     else:

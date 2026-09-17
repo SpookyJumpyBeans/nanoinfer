@@ -31,6 +31,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--system", help="system prompt, with --chat")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--show-prompt", action="store_true", help="print the prompt as tokenized")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="disable the KV cache; much slower, kept for comparison")
     args = parser.parse_args(argv)
 
     print(f"loading {args.model}", file=sys.stderr)
@@ -78,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         max_new_tokens=args.max_tokens,
         stop_ids=[i for i in stop_ids if i is not None],
         on_token=on_token,
+        use_cache=not args.no_cache,
     )
 
     print()
@@ -85,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         f"\n{len(prompt_ids)} prompt + {len(result.generated_ids)} generated tokens"
         f"  |  ttft {result.time_to_first_token_ms:.0f} ms"
         f"  |  decode {result.decode_tokens_per_second:.2f} tok/s"
+        f"  |  kv cache {'on' if result.used_cache else 'off'}"
         f"  |  stopped: {result.stop_reason}",
         file=sys.stderr,
     )

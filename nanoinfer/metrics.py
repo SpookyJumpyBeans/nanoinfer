@@ -109,9 +109,25 @@ def machine_fingerprint() -> dict[str, object]:
     """
     import os
 
+    # BLAS thread settings are recorded because they change results
+    # substantially and are invisible in the code. Leaving them unset does not
+    # mean single-threaded; it means the library picks, and what it picks
+    # depends on the machine.
+    blas_env = {
+        name: os.environ[name]
+        for name in (
+            "OPENBLAS_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        )
+        if name in os.environ
+    }
+
     return {
         "platform": platform.platform(),
         "processor": platform.processor() or platform.machine(),
         "python": platform.python_version(),
         "cpu_count_logical": os.cpu_count(),
+        "blas_threads_env": blas_env or "unset (library default)",
     }

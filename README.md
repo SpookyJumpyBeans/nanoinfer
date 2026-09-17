@@ -19,8 +19,8 @@ The engine's entire runtime dependency list is `numpy`.
 | 1 | Parse safetensors, verify every tensor against the config | **done** |
 | 2 | BPE tokenizer, exact round-trip vs. the reference on 10k strings | **done** |
 | 3 | float32 forward pass, no cache, greedy; logits within 1e-3 of reference | **done** |
-| 4 | KV cache; bit-identical output, measured speedup | next |
-| 5 | Temperature / top-k / top-p sampling with a seeded RNG | |
+| 4 | KV cache; identical output, measured speedup | **done** |
+| 5 | Temperature / top-k / top-p sampling with a seeded RNG | next |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | |
 | 7 | Rust port: CPU SIMD, then WebGPU compute kernels | |
 | 8 | Benchmark against llama.cpp on identical hardware | |
@@ -114,6 +114,83 @@ That 0.25 tok/s is not a disappointing result, it is the baseline. Every step
 re-embeds and re-attends over the entire sequence, so the 24th token costs
 noticeably more than the first — the 1.26× above is the quadratic cost becoming
 visible over just 24 tokens. Phase 4 exists to delete that.
+
+> **These numbers are superseded.** They are a mean over a single cold run, and
+> phase 4 established that a single run on this machine can be off by an order
+> of magnitude. Re-measured warm, with medians, the same uncached code does
+> 3.46 tok/s -- see phase 4. The row is left here rather than edited, because
+> the measurement really was taken and the lesson is what it cost.
+
+### Phase 4 — KV cache
+
+Both paths measured by alternating them in one process, three rounds each, same
+prompt, same 24 generated tokens:
+
+| | No cache | KV cache |
+|---|---:|---:|
+| Decode | 3.46 tok/s | **12.06 tok/s** |
+| Median step | 288.7 ms | **82.9 ms** |
+| Total wall time | 6.39 s | **2.06 s** |
+| Time to first token | 200 ms | 152 ms |
+| Arithmetic done | 396 positions | **28 positions** |
+
+**Output is identical** — same token IDs, cached and uncached, on all 494M real
+parameters across three prompts and every round. Logits agree to 1e-4 rather
+than bitwise: the cache changes the shape of every matmul in the model, BLAS
+sums the same products in a different order, and float addition is not
+associative. Claiming bitwise equality would be claiming something false.
+
+### The speedup is 3.5×, from 14× less arithmetic — and the gap is the point
+
+Those two numbers not matching is the most useful thing phase 4 produced.
+
+Decoding one token reads **every weight in the model** — 1.98 GB — to produce a
+single 896-value vector. At 82.9 ms per token that is **24 GB/s effective**,
+which is roughly this laptop's DRAM bandwidth. The decode step is not
+arithmetic-bound, it is bandwidth-bound: the machine spends its time waiting
+for weights, and most of its floating-point capacity sits idle.
+
+So removing 93% of the arithmetic buys only 3.5×, because the arithmetic was
+never the constraint. The uncached path was accidentally efficient — it pushed
+17 positions through each matmul instead of one, which is exactly what makes a
+GEMM worth its memory traffic.
+
+Two consequences worth carrying forward:
+
+- The only way past a bandwidth wall is to move fewer bytes. INT8 halves them,
+  INT4 quarters them. That is phase 6, and it is now a bandwidth argument
+  rather than a memory-footprint one.
+- Serving engines batch many sequences through one weight read for the same
+  reason. This engine is single-stream by design, so it leaves that on the
+  table knowingly.
+
+The speedup is asserted in tests as **work**, not wall time — positions pushed
+through the model, which is exact and deterministic. Timings live in the
+benchmark, where the machine that produced them is recorded alongside.
+
+### Measuring on this machine
+
+This laptop produces sporadic multi-second stalls under sustained load. Across
+repeats of the *same* generation, totals have ranged from 2.97 s to 17.32 s,
+and a single decode step has been 145× slower than the fastest in the same run.
+
+I misread this at first. A matmul sweep showed a 15× cliff at exactly the
+prompt length in use, which looked like a BLAS threading pathology worth
+writing up. Re-running it twice put the spike at a different size each time —
+there is no pathological size, only a noisy machine. The finding was an
+artifact, and two more runs were cheaper than publishing it.
+
+What the benchmark does about it:
+
+- **Medians and minima, never means.** One stall makes a mean meaningless.
+- **A/B by alternation.** Separate runs are not comparable when throughput
+  drifts by more than the effect being measured, so `cache_ab` interleaves both
+  paths in one process. Whatever the machine is doing, it does to both.
+- **Spread is printed** next to every headline number, so the noise is visible
+  instead of averaged into something that looks precise and is not.
+- **BLAS thread settings are recorded** with each result. Leaving them unset
+  does not mean single-threaded; it means the library chooses, based on the
+  machine.
 
 Perplexity and the llama.cpp comparison land in phases 6–8.
 
@@ -305,6 +382,54 @@ associative — so the results differ by ~1e-5 on logits reaching 19. Phase 4
 will claim the KV cache reproduces the uncached path exactly; that claim has to
 be made at this tolerance, not at zero.
 
+## The KV cache
+
+Keys and values depend only on their own token and its position. Token 3's key
+is the same whether the sequence is 4 tokens long or 400 — so once computed it
+never needs computing again. Phase 3 recomputed all of them at every step
+anyway.
+
+Storage is pre-allocated with a watermark rather than appended to: growing a
+list and re-concatenating each step would reintroduce exactly the copying the
+cache exists to remove. `extend()` writes one layer's new keys and hands back a
+zero-copy view of everything so far.
+
+### Two invariants that turn silent corruption into exceptions
+
+`extend()` deliberately does **not** advance the length; `commit()` does that
+once, after every layer has written. Splitting them catches both ways the cache
+can be driven wrong:
+
+- **A layer that skips the cache** would leave stale values in its slots and
+  attend over them next step as though they were real. `commit()` refuses
+  unless every layer has written, and names the ones that did not.
+- **A layer that writes twice** would put two tokens in one slot. Rejected.
+
+### Keys are stored after RoPE
+
+A token's position never changes, so rotating once on insert is both correct
+and cheaper than re-rotating the whole history each step. Rotating again on
+read would apply the rotation twice to every cached key — fluent output with a
+scrambled sense of order.
+
+The matching trap is on the query side: `positions` must continue past the
+cache. Defaulting a decode step to position 0 instead of `cache.length` rotates
+every generated token as though it were the first. A test injects that exact
+bug and asserts it produces finite, different numbers rather than an error,
+because that is what makes it dangerous.
+
+### Verified by equality, not plausibility
+
+Every way of getting a cache wrong produces fluent text, so the gate is
+equality of output: the same 8 tokens split across five chunking patterns — one
+shot, one at a time, prompt-then-decode, halves, ragged — must all give what a
+single uncached pass gives. Chunk shape is what exercises the mask offsets and
+the position arithmetic, which is where a cache actually breaks.
+
+Cache size is 24 KiB per token across all 24 layers. Grouped-query attention is
+what makes that affordable: with 14 KV heads instead of 2 it would be 168 KiB
+per token, and a full 32k context would want 5.5 GB.
+
 ## Two things about Qwen2.5 that will break a naive implementation
 
 **Tied embeddings.** `config.json` sets `tie_word_embeddings: true`, so there is
@@ -338,7 +463,8 @@ nanoinfer/
   weights.py          typed, shape-checked weight loading
   attention.py        grouped-query self-attention
   model.py            SwiGLU, the block, the forward pass
-  generate.py         greedy decoding
+  kvcache.py          pre-allocated key/value storage
+  generate.py         greedy decoding, cached or not
 tools/
   download_model.py   four HTTPS GETs, no huggingface_hub
   inspect_weights.py  phase 1: prove every tensor is understood
@@ -362,8 +488,9 @@ python -m tools.inspect_weights models/Qwen2.5-0.5B-Instruct
 python -m bench.benchmark load
 python -m bench.benchmark tokenize
 python -m bench.benchmark generate
+python -m bench.benchmark cache_ab                 # cached vs uncached, interleaved
 python -m bench.benchmark --compare
-python -m pytest                                    # 549 tests
+python -m pytest                                    # 624 tests
 ```
 
 Run the model:
