@@ -20,8 +20,8 @@ The engine's entire runtime dependency list is `numpy`.
 | 2 | BPE tokenizer, exact round-trip vs. the reference on 10k strings | **done** |
 | 3 | float32 forward pass, no cache, greedy; logits within 1e-3 of reference | **done** |
 | 4 | KV cache; identical output, measured speedup | **done** |
-| 5 | Temperature / top-k / top-p sampling with a seeded RNG | next |
-| 6 | INT8 then INT4 quantization, perplexity delta at each level | |
+| 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
+| 6 | INT8 then INT4 quantization, perplexity delta at each level | next |
 | 7 | Rust port: CPU SIMD, then WebGPU compute kernels | |
 | 8 | Benchmark against llama.cpp on identical hardware | |
 
@@ -191,6 +191,70 @@ What the benchmark does about it:
 - **BLAS thread settings are recorded** with each result. Leaving them unset
   does not mean single-threaded; it means the library chooses, based on the
   machine.
+
+### Phase 5 — sampling
+
+| Check | Result |
+|---|---|
+| Temperature vs. `TemperatureLogitsWarper` | exact, 7 values |
+| Top-k vs. `TopKLogitsWarper` | exact, 200 random vectors incl. forced ties |
+| Top-p vs. `TopPLogitsWarper` | exact indices, 400 random vectors |
+| Fixed seed reproduces text | identical, real weights |
+| Temperature 0 vs. phase 4 greedy | token-for-token identical |
+
+```
+seed 1: Once upon a time, there was a small town named Greenfield. The town was known
+seed 1: Once upon a time, there was a small town named Greenfield. The town was known
+seed 2: Once upon a time, in the year 2000, a group of friends
+```
+
+Per-token cost, against the 83 ms decode step from phase 4:
+
+| | |
+|---|---:|
+| argmax (greedy) | 0.03 ms |
+| top-k alone (k=20) | 0.94 ms |
+| **top-p alone (p=0.8)** | **22.36 ms** |
+| full sampler, temperature → k → p → draw | **7.69 ms** |
+
+The full pipeline is three times faster than top-p on its own. Top-p has to sort
+all 151,936 logits, but running top-k first leaves 151,916 of them identical
+`-inf`, and the sort is far cheaper on that. The order sampling *has* to run in
+turns out to be the fast one too. It is still ~9% of a decode step, and sorting
+a whole vocabulary to find a cut near the top is the obvious thing for phase 7
+to attack.
+
+### Two formulations that are equal on paper and not in float32
+
+Nucleus sampling is usually described as "sort descending, accumulate, stop when
+the sum reaches p." Implementing it that way and differential-testing against
+the reference produced disagreements — all of them ties landing on opposite
+sides of the cut. For 100 equiprobable tokens at p=0.5 the descending sum
+reaches `0.4999997913837433`, a hair under the boundary, so `>= p` keeps one
+more token than the reference's `<= 1 - p` on the ascending sum.
+
+Neither is more correct. The implementation follows the reference, because
+`top_p=0.8` selecting the same nucleus here as everywhere else is the only thing
+a user of that parameter can rely on.
+
+A second, smaller one: sorting must be **stable**. `torch.sort` orders the tied
+pair in `[1, 1, 0, 0]` as `[2, 3, 0, 1]`; numpy's default quicksort gives
+`[3, 2, 1, 0]`. That changes which token counts as most likely, and a `p` small
+enough to keep exactly one keeps the wrong one.
+
+### Two things I measured wrong first
+
+Worth recording because both were confident and both were wrong:
+
+- I asserted a trained model emits no exact float ties, and rested a test on it.
+  A real forward pass here produces **about 620 exact float32 collisions** among
+  its 151,936 logits. They sit in the low-probability tail, so no realistic
+  nucleus boundary falls inside a tied group — but the ties are real.
+- Correcting that, I then claimed the 271 untrained embedding rows past the
+  tokenizer's vocabulary carry *identical* logits. I had read rounded output.
+  They span a band about 6e-3 wide. What actually matters held up: they carry
+  under 1e-6 of the probability mass and any truncation removes them, and that
+  is now asserted as a number rather than described in prose.
 
 Perplexity and the llama.cpp comparison land in phases 6–8.
 
@@ -430,6 +494,34 @@ Cache size is 24 KiB per token across all 24 layers. Grouped-query attention is
 what makes that affordable: with 14 KV heads instead of 2 it would be 168 KiB
 per token, and a full 32k context would want 5.5 GB.
 
+## Sampling
+
+| | |
+|---|---|
+| [`sampling.py`](nanoinfer/sampling.py) | temperature, top-k, top-p, seeded draw |
+
+Order is temperature → top-k → top-p → softmax → draw, and it is not
+interchangeable. Temperature changes the probabilities the two truncations
+threshold against, so running top-p first would nucleus-sample a distribution
+the model never produced and make `top_p` mean something different at every
+temperature.
+
+`temperature=0` short-circuits to the argmax rather than dividing by zero: it is
+the limit of the distribution, it is how every other engine spells greedy, and
+it makes the seed irrelevant. Greedy is kept as the reference the sampled paths
+are checked against, since it is the only setting whose output can be compared
+token for token with another engine.
+
+`SamplingConfig.from_model_dir` reads what the model itself ships — Qwen2.5
+declares temperature 0.7, top-k 20, top-p 0.8. `repetition_penalty` is
+deliberately *not* read: it is a logits processor, this phase does not implement
+it, and silently honouring a declared value the engine ignores would repeat the
+phase 3 trap in reverse.
+
+Draws use an inverse-CDF search rather than `rng.choice`, which is the
+definition of a multinomial draw and does not require the probabilities to sum
+to exactly 1.0 in floating point.
+
 ## Two things about Qwen2.5 that will break a naive implementation
 
 **Tied embeddings.** `config.json` sets `tie_word_embeddings: true`, so there is
@@ -464,7 +556,8 @@ nanoinfer/
   attention.py        grouped-query self-attention
   model.py            SwiGLU, the block, the forward pass
   kvcache.py          pre-allocated key/value storage
-  generate.py         greedy decoding, cached or not
+  sampling.py         temperature, top-k, top-p, seeded draw
+  generate.py         the decode loop, greedy or sampled
 tools/
   download_model.py   four HTTPS GETs, no huggingface_hub
   inspect_weights.py  phase 1: prove every tensor is understood
@@ -490,7 +583,7 @@ python -m bench.benchmark tokenize
 python -m bench.benchmark generate
 python -m bench.benchmark cache_ab                 # cached vs uncached, interleaved
 python -m bench.benchmark --compare
-python -m pytest                                    # 624 tests
+python -m pytest                                    # 675 tests
 ```
 
 Run the model:
@@ -498,6 +591,10 @@ Run the model:
 ```bash
 python -m tools.generate --prompt "The capital of France is" --max-tokens 20
 python -m tools.generate --chat "Explain RoPE in one sentence."
+
+# sampling; --model-defaults uses Qwen2.5's own T=0.7 k=20 p=0.8
+python -m tools.generate --prompt "Once upon a time" --model-defaults --seed 1
+python -m tools.generate --prompt "Once upon a time" --temperature 0.9 --top-p 0.95 --seed 42
 ```
 
 `tools.inspect_weights` builds the complete expected tensor manifest from
