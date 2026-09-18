@@ -27,6 +27,8 @@ temperature would nucleus-sample a distribution the model never produced.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 # The value masked-out logits are set to. -inf is exact: exp(-inf) is zero, so
@@ -89,11 +91,15 @@ def top_p_filter(logits: np.ndarray, p: float) -> np.ndarray:
 
     ``p`` of 1.0 disables the filter.
 
-    Sort by probability descending, accumulate, and keep every token up to and
-    *including* the one that carries the running total to ``p``. Including the
-    crossing token is what guarantees the kept mass is at least ``p`` rather
-    than just under it, and it is why the argmax always survives: with p > 0
-    the first token alone already crosses, or is kept regardless.
+    Equivalently: drop the least likely tail whose mass is under ``1 - p``.
+    Everything above that cut survives, including the token the boundary falls
+    on, which is what makes the kept mass at least ``p`` rather than just under
+    it. The most likely token always survives, even when ``p`` is smaller than
+    its own probability.
+
+    (Stated as a tail-drop rather than as "accumulate descending until the sum
+    reaches p" because that is how it is implemented, and the two are not
+    interchangeable in float32 -- see the comment in the body.)
 
     Unlike top-k, the size of the surviving set is not fixed. When the model is
     confident a single token can carry 90% of the mass and the nucleus is one
@@ -142,3 +148,107 @@ def top_p_filter(logits: np.ndarray, p: float) -> np.ndarray:
     filtered = logits.copy()
     filtered[discard] = FILTER_VALUE
     return filtered
+
+
+@dataclass(frozen=True, slots=True)
+class SamplingConfig:
+    """How to turn logits into a token.
+
+    Defaults are the identity: temperature 1, no truncation. That is sampling
+    from the model's own distribution, unmodified.
+    """
+
+    temperature: float = 1.0
+    top_k: int = 0          # 0 disables
+    top_p: float = 1.0      # 1.0 disables
+    seed: int | None = None
+
+    @property
+    def is_greedy(self) -> bool:
+        return self.temperature == 0.0
+
+    @classmethod
+    def greedy(cls) -> "SamplingConfig":
+        return cls(temperature=0.0)
+
+    @classmethod
+    def from_model_dir(cls, model_dir, seed: int | None = None) -> "SamplingConfig":
+        """Read the sampling defaults the model itself ships.
+
+        Qwen2.5 declares temperature 0.7, top_p 0.8 and top_k 20 in
+        ``generation_config.json``. Those are the settings the model was tuned
+        to be used with, so defaulting to them makes this engine behave like
+        every other one running the same weights.
+
+        ``repetition_penalty`` is deliberately not read. It is a logits
+        processor rather than a sampling parameter, phase 5 does not implement
+        it, and silently ignoring a declared value would be worse than not
+        claiming to support it -- see the phase 3 finding that transformers
+        applies it even when do_sample is False.
+        """
+        import json
+        from pathlib import Path
+
+        path = Path(model_dir) / "generation_config.json"
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        return cls(
+            temperature=float(data.get("temperature", 1.0)),
+            top_k=int(data.get("top_k", 0) or 0),
+            top_p=float(data.get("top_p", 1.0)),
+            seed=seed,
+        )
+
+
+class Sampler:
+    """Applies the filters in order and draws one token.
+
+    Order is temperature, then top-k, then top-p, then softmax, then draw.
+    Temperature has to come first because it changes the probabilities the
+    truncations threshold against; nucleus-sampling a distribution the model
+    never produced would make ``top_p`` mean something different at every
+    temperature.
+    """
+
+    def __init__(self, config: SamplingConfig | None = None) -> None:
+        self.config = config or SamplingConfig()
+        self._rng = np.random.default_rng(self.config.seed)
+
+    def reset(self) -> None:
+        """Restart the RNG from the configured seed.
+
+        Reproducibility is per-sampler, not global: two runs match when they
+        start from the same seed and draw the same number of times. Reusing one
+        sampler across two generations without resetting gives the second a
+        different stream, which is correct but is not a repeat of the first.
+        """
+        self._rng = np.random.default_rng(self.config.seed)
+
+    def filter(self, logits: np.ndarray) -> np.ndarray:
+        """The masked logits this sampler would draw from. Exposed for tests."""
+        if self.config.is_greedy:
+            return logits
+
+        filtered = apply_temperature(logits, self.config.temperature)
+        filtered = top_k_filter(filtered, self.config.top_k)
+        return top_p_filter(filtered, self.config.top_p)
+
+    def probabilities(self, logits: np.ndarray) -> np.ndarray:
+        """The distribution actually sampled from, after filtering."""
+        filtered = self.filter(logits)
+        shifted = filtered - np.max(filtered)
+        probabilities = np.exp(shifted)
+        return probabilities / probabilities.sum()
+
+    def __call__(self, logits: np.ndarray) -> int:
+        """Draw one token id."""
+        if self.config.is_greedy:
+            return int(np.argmax(logits))
+
+        probabilities = self.probabilities(logits)
+
+        # Inverse-CDF draw. searchsorted on the cumulative distribution is the
+        # definition of multinomial sampling, and unlike rng.choice it does not
+        # require the probabilities to sum to exactly 1.0 in floating point.
+        cumulative = np.cumsum(probabilities)
+        drawn = int(np.searchsorted(cumulative, self._rng.random()))
+        return min(drawn, len(probabilities) - 1)

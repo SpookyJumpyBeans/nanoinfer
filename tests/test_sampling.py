@@ -14,7 +14,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from nanoinfer.sampling import apply_temperature, top_k_filter, top_p_filter
+from nanoinfer.sampling import (
+    Sampler,
+    SamplingConfig,
+    apply_temperature,
+    top_k_filter,
+    top_p_filter,
+)
 
 torch = pytest.importorskip("torch", reason="reference oracle not installed")
 
@@ -282,3 +288,120 @@ def test_top_p_is_deterministic_under_ties():
     first = kept(top_p_filter(logits, 0.5))
     for _ in range(5):
         np.testing.assert_array_equal(kept(top_p_filter(logits, 0.5)), first)
+
+
+# -- the sampler -----------------------------------------------------------
+
+
+def test_greedy_config_takes_the_argmax(rng):
+    logits = rng.standard_normal(500).astype(np.float32) * 4
+    sampler = Sampler(SamplingConfig.greedy())
+    assert sampler(logits) == int(np.argmax(logits))
+
+
+def test_greedy_ignores_the_seed(rng):
+    logits = rng.standard_normal(100).astype(np.float32)
+    a = Sampler(SamplingConfig(temperature=0.0, seed=1))(logits)
+    b = Sampler(SamplingConfig(temperature=0.0, seed=999))(logits)
+    assert a == b == int(np.argmax(logits))
+
+
+def test_same_seed_gives_the_same_sequence(rng):
+    """The reproducibility the phase is graded on."""
+    logits = rng.standard_normal(1000).astype(np.float32) * 3
+    config = SamplingConfig(temperature=0.8, top_k=40, top_p=0.9, seed=1234)
+
+    first = [Sampler(config)(logits) for _ in range(1)]
+    one = Sampler(config)
+    two = Sampler(config)
+    assert [one(logits) for _ in range(20)] == [two(logits) for _ in range(20)]
+    assert first == [Sampler(config)(logits)]
+
+
+def test_different_seeds_diverge(rng):
+    logits = rng.standard_normal(1000).astype(np.float32) * 3
+    a = Sampler(SamplingConfig(temperature=1.0, seed=1))
+    b = Sampler(SamplingConfig(temperature=1.0, seed=2))
+    assert [a(logits) for _ in range(20)] != [b(logits) for _ in range(20)]
+
+
+def test_reset_replays_the_stream(rng):
+    logits = rng.standard_normal(500).astype(np.float32) * 3
+    sampler = Sampler(SamplingConfig(temperature=1.0, seed=7))
+    first = [sampler(logits) for _ in range(15)]
+    sampler.reset()
+    assert [sampler(logits) for _ in range(15)] == first
+
+
+def test_without_reset_the_stream_continues(rng):
+    """Reusing a sampler is not a repeat; documented so it cannot surprise."""
+    logits = rng.standard_normal(500).astype(np.float32) * 3
+    sampler = Sampler(SamplingConfig(temperature=1.0, seed=7))
+    first = [sampler(logits) for _ in range(15)]
+    second = [sampler(logits) for _ in range(15)]
+    assert first != second
+
+
+def test_filtered_tokens_are_never_drawn(rng):
+    """A masked token has probability exactly zero, not merely a small one."""
+    logits = rng.standard_normal(200).astype(np.float32) * 2
+    config = SamplingConfig(temperature=1.0, top_k=5, seed=3)
+    sampler = Sampler(config)
+
+    allowed = set(kept(sampler.filter(logits)))
+    assert len(allowed) == 5
+    drawn = {sampler(logits) for _ in range(2000)}
+    assert drawn <= allowed
+
+
+def test_draws_follow_the_filtered_distribution():
+    """Statistical check: empirical frequencies track the probabilities."""
+    logits = np.log(np.array([0.5, 0.3, 0.15, 0.05], dtype=np.float32))
+    sampler = Sampler(SamplingConfig(temperature=1.0, seed=11))
+
+    expected = sampler.probabilities(logits)
+    counts = np.zeros(4)
+    draws = 40_000
+    for _ in range(draws):
+        counts[sampler(logits)] += 1
+
+    np.testing.assert_allclose(counts / draws, expected, atol=0.01)
+
+
+def test_probabilities_sum_to_one(rng):
+    logits = rng.standard_normal(300).astype(np.float32) * 3
+    sampler = Sampler(SamplingConfig(temperature=0.7, top_k=20, top_p=0.8))
+    assert sampler.probabilities(logits).sum() == pytest.approx(1.0)
+
+
+def test_temperature_is_applied_before_truncation(rng):
+    """Order matters: top-p thresholds the temperature-scaled distribution.
+
+    If top-p ran first it would threshold a distribution the model never
+    produced, and top_p would mean something different at every temperature.
+    """
+    logits = np.array([3.0, 2.0, 1.0, 0.0], dtype=np.float32)
+    hot = Sampler(SamplingConfig(temperature=5.0, top_p=0.8))
+    cold = Sampler(SamplingConfig(temperature=0.2, top_p=0.8))
+    assert len(kept(hot.filter(logits))) > len(kept(cold.filter(logits)))
+
+
+def test_default_config_is_the_identity(rng):
+    """No temperature change, no truncation: the model's own distribution."""
+    logits = rng.standard_normal(100).astype(np.float32) * 2
+    sampler = Sampler()
+    np.testing.assert_allclose(sampler.filter(logits), logits, rtol=1e-6)
+
+
+def test_reads_the_models_shipped_defaults():
+    from pathlib import Path
+
+    model_dir = Path(__file__).resolve().parent.parent / "models" / "Qwen2.5-0.5B-Instruct"
+    if not (model_dir / "generation_config.json").exists():
+        pytest.skip("model not downloaded")
+
+    config = SamplingConfig.from_model_dir(model_dir, seed=42)
+    assert config.temperature == 0.7
+    assert config.top_k == 20
+    assert config.top_p == 0.8
+    assert config.seed == 42
