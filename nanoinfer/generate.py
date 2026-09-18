@@ -1,8 +1,12 @@
-"""Greedy decoding: the loop that turns a forward pass into text.
+"""The decode loop that turns a forward pass into text.
 
 Autoregressive generation is the forward pass in a loop. Run the model, take
-the logits for the last position, pick a token, append it, run again. Phase 5
-replaces "pick the argmax" with temperature, top-k and top-p.
+the logits for the last position, pick a token, append it, run again.
+
+How the token is picked is the only thing that varies: argmax by default, or a
+:class:`nanoinfer.sampling.Sampler` for temperature, top-k and top-p. There is
+one loop rather than a greedy one and a sampled one, because everything except
+that single choice is identical and two copies would drift.
 
 Two strategies live here, and the uncached one is kept deliberately:
 
@@ -47,6 +51,8 @@ class GenerationResult:
     decode_s: float = 0.0
     stop_reason: str = "max_tokens"
     used_cache: bool = False
+    sampled: bool = False
+    seed: int | None = None
 
     @property
     def all_ids(self) -> list[int]:
@@ -76,14 +82,21 @@ class GenerationResult:
         return len(self.prompt_ids) / self.prefill_s if self.prefill_s else 0.0
 
 
-def greedy_stream(
+def generate_stream(
     model,
     prompt_ids: Sequence[int],
     max_new_tokens: int = 64,
     stop_ids: Sequence[int] = (),
     cache=None,
+    sampler=None,
 ) -> Iterator[int]:
-    """Yield generated token IDs one at a time, taking the argmax each step.
+    """Yield generated token IDs one at a time.
+
+    ``sampler`` chooses each token from the logits. ``None`` means take the
+    argmax, which is what phases 3 and 4 did and what every existing test
+    expects; pass a :class:`nanoinfer.sampling.Sampler` to sample instead.
+    The loop itself is identical either way -- only the choice of token
+    differs, which is why there is one loop here and not two.
 
     Streaming rather than returning a list, because a slow decode loop is
     unbearable to wait on in silence and because it lets a caller stop early
@@ -105,11 +118,12 @@ def greedy_stream(
         return
 
     stop = set(stop_ids)
+    pick = sampler if sampler is not None else (lambda logits: int(np.argmax(logits)))
 
     if cache is None:
         tokens = list(prompt_ids)
         for _ in range(max_new_tokens):
-            next_id = int(np.argmax(model.next_token_logits(np.array(tokens))))
+            next_id = int(pick(model.next_token_logits(np.array(tokens))))
             tokens.append(next_id)
             yield next_id
             if next_id in stop:
@@ -126,7 +140,7 @@ def greedy_stream(
     logits = model.next_token_logits(np.array(prompt_ids), cache=cache)
 
     for step in range(max_new_tokens):
-        next_id = int(np.argmax(logits))
+        next_id = int(pick(logits))
         yield next_id
 
         if next_id in stop:
@@ -137,6 +151,22 @@ def greedy_stream(
         logits = model.next_token_logits(np.array([next_id]), cache=cache)
 
 
+def greedy_stream(
+    model,
+    prompt_ids: Sequence[int],
+    max_new_tokens: int = 64,
+    stop_ids: Sequence[int] = (),
+    cache=None,
+) -> Iterator[int]:
+    """Always take the argmax. Kept as the name the correctness tests use.
+
+    Greedy decoding is not one sampling strategy among several here -- it is
+    the reference the sampled paths are checked against, because it is the only
+    one whose output can be compared token for token with another engine.
+    """
+    yield from generate_stream(model, prompt_ids, max_new_tokens, stop_ids, cache)
+
+
 def greedy(
     model,
     prompt_ids: Sequence[int],
@@ -144,12 +174,14 @@ def greedy(
     stop_ids: Sequence[int] = (),
     on_token=None,
     use_cache: bool = True,
+    sampler=None,
 ) -> GenerationResult:
-    """Generate greedily, timing the first token separately from the rest.
+    """Generate, timing the first token separately from the rest.
 
     ``on_token`` is called with each ID as it arrives, for callers that print
     as they go. ``use_cache=False`` selects the uncached path, which exists so
-    the two can be compared.
+    the two can be compared. ``sampler`` defaults to None, meaning argmax; pass
+    a Sampler to sample instead.
 
     Timing is taken from the stream rather than by running a separate prefill
     pass. Prefilling twice to get a clean measurement would both distort the
@@ -161,12 +193,16 @@ def greedy(
     result = GenerationResult(prompt_ids=list(prompt_ids))
     cache = model.new_cache(len(prompt_ids) + max_new_tokens) if use_cache else None
     result.used_cache = cache is not None
+    result.sampled = sampler is not None
+    result.seed = getattr(getattr(sampler, "config", None), "seed", None)
     stop = set(stop_ids)
 
     started = time.perf_counter()
     first_token_at: float | None = None
 
-    for token_id in greedy_stream(model, prompt_ids, max_new_tokens, stop_ids, cache):
+    for token_id in generate_stream(
+        model, prompt_ids, max_new_tokens, stop_ids, cache, sampler
+    ):
         now = time.perf_counter()
         if first_token_at is None:
             first_token_at = now

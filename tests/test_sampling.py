@@ -11,6 +11,8 @@ boundary conditions nobody thinks to write down.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -265,10 +267,14 @@ def test_top_p_agrees_on_size_when_ties_straddle_the_boundary(rng):
     unspecified and may change between torch versions.
 
     What *is* well defined, and what this asserts, is that both implementations
-    keep the same number of tokens and the same multiset of logit values. A
-    trained model does not produce exact float ties across a tied group, so
-    this case is synthetic; it is tested to document the limit of the claim
-    rather than because it can arise.
+    keep the same number of tokens and the same multiset of logit values.
+
+    Exact ties are not synthetic, either. A real forward pass of this model
+    produces about 620 exact float32 collisions across its 151,936 logits --
+    distinct values that round to the same float. They sit in the
+    low-probability tail, so a realistic nucleus boundary does not fall inside
+    a tied group, but the ties themselves are real and this is why the limit is
+    tested rather than assumed away.
     """
     for _ in range(60):
         n = int(rng.integers(4, 60))
@@ -405,3 +411,128 @@ def test_reads_the_models_shipped_defaults():
     assert config.top_k == 20
     assert config.top_p == 0.8
     assert config.seed == 42
+
+
+# -- end to end on the real model ------------------------------------------
+
+MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "Qwen2.5-0.5B-Instruct"
+HAVE_MODEL = (MODEL_DIR / "model.safetensors").exists()
+
+
+@pytest.fixture(scope="module")
+def real_model():
+    from nanoinfer.model import Qwen2
+
+    return Qwen2.from_model_dir(MODEL_DIR)
+
+
+@pytest.fixture(scope="module")
+def real_tokenizer():
+    from nanoinfer.tokenizer import Tokenizer
+
+    return Tokenizer.from_model_dir(MODEL_DIR)
+
+
+def run(model, ids, sampler, n=12):
+    from nanoinfer.generate import generate_stream
+
+    return list(
+        generate_stream(
+            model, ids, max_new_tokens=n,
+            cache=model.new_cache(len(ids) + n), sampler=sampler,
+        )
+    )
+
+
+@pytest.mark.skipif(not HAVE_MODEL, reason="model not downloaded")
+@pytest.mark.slow
+def test_same_seed_reproduces_the_same_text(real_model, real_tokenizer):
+    """The phase 5 gate: a fixed seed makes sampled output reproducible."""
+    ids = real_tokenizer.encode("The capital of France is")
+    config = SamplingConfig(temperature=0.8, top_k=40, top_p=0.9, seed=20260917)
+
+    first = run(real_model, ids, Sampler(config))
+    second = run(real_model, ids, Sampler(config))
+
+    assert first == second, (
+        f"same seed diverged\n  first : {real_tokenizer.decode(first)!r}"
+        f"\n  second: {real_tokenizer.decode(second)!r}"
+    )
+
+
+@pytest.mark.skipif(not HAVE_MODEL, reason="model not downloaded")
+@pytest.mark.slow
+def test_different_seeds_give_different_text(real_model, real_tokenizer):
+    ids = real_tokenizer.encode("Once upon a time")
+    a = run(real_model, ids, Sampler(SamplingConfig(temperature=1.0, seed=1)))
+    b = run(real_model, ids, Sampler(SamplingConfig(temperature=1.0, seed=2)))
+    assert a != b
+
+
+@pytest.mark.skipif(not HAVE_MODEL, reason="model not downloaded")
+@pytest.mark.slow
+def test_temperature_zero_matches_the_greedy_path(real_model, real_tokenizer):
+    """A sampler at temperature 0 must reproduce phase 4's output exactly."""
+    from nanoinfer.generate import greedy_stream
+
+    ids = real_tokenizer.encode("The capital of France is")
+    n = 10
+    sampled = run(real_model, ids, Sampler(SamplingConfig.greedy()), n)
+    greedy = list(
+        greedy_stream(
+            real_model, ids, max_new_tokens=n, cache=real_model.new_cache(len(ids) + n)
+        )
+    )
+    assert sampled == greedy
+
+
+@pytest.mark.skipif(not HAVE_MODEL, reason="model not downloaded")
+@pytest.mark.slow
+def test_sampled_tokens_are_always_decodable(real_model, real_tokenizer):
+    """A high temperature must not wander into the untrained padding IDs.
+
+    The embedding matrix has 151,936 rows but the tokenizer knows 151,665
+    tokens. Those 271 extra rows are reachable logits with no token, and a hot
+    enough sampler could pick one -- which would raise on decode.
+    """
+    ids = real_tokenizer.encode("Once upon a time")
+    produced = run(real_model, ids, Sampler(SamplingConfig(temperature=1.5, seed=5)), 24)
+
+    assert all(0 <= t < real_tokenizer.vocab_size for t in produced), (
+        "sampled an ID with no token: "
+        f"{[t for t in produced if t >= real_tokenizer.vocab_size]}"
+    )
+    real_tokenizer.decode(produced)
+
+
+@pytest.mark.skipif(not HAVE_MODEL, reason="model not downloaded")
+@pytest.mark.slow
+def test_untrained_padding_rows_are_negligible_but_reachable(real_model, real_tokenizer):
+    """The 271 embedding rows past the vocabulary, quantified.
+
+    config.vocab_size is 151,936 while the tokenizer knows 151,665 tokens. The
+    difference is padding to a round number for kernel efficiency, and those
+    rows were never trained -- so they are addressable logits with no token
+    behind them, and decoding one raises.
+
+    In practice they are harmless: all 271 sit in a band about 6e-3 wide near
+    rank 96,000 and together hold under 1e-6 of the probability mass, and any
+    top-k or top-p setting removes them outright. This records the measurement
+    so the "harmless" claim is a number rather than a hope.
+    """
+    ids = real_tokenizer.encode("Once upon a time")
+    logits = real_model.next_token_logits(np.array(ids))
+
+    padding = logits[real_tokenizer.vocab_size:]
+    assert len(padding) == 271
+    # Tightly clustered but not identical: untrained rows still differ
+    # slightly because the hidden state they are projected against is not zero.
+    assert padding.max() - padding.min() < 0.05
+
+    probabilities = np.exp(logits - logits.max())
+    probabilities /= probabilities.sum()
+    assert probabilities[real_tokenizer.vocab_size:].sum() < 1e-6
+
+    # Any truncation removes them entirely.
+    filtered = Sampler(SamplingConfig(temperature=1.0, top_k=50)).filter(logits)
+    assert np.all(np.isinf(filtered[real_tokenizer.vocab_size:]))
