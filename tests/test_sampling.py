@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from nanoinfer.sampling import apply_temperature, top_k_filter
+from nanoinfer.sampling import apply_temperature, top_k_filter, top_p_filter
 
 torch = pytest.importorskip("torch", reason="reference oracle not installed")
 
@@ -177,3 +177,108 @@ def test_top_k_matches_reference_on_random_logits(rng):
             np.isinf(mine), np.isinf(theirs), err_msg=f"n={n} k={k}"
         )
         np.testing.assert_allclose(mine[kept(mine)], theirs[kept(theirs)], rtol=1e-6)
+
+
+def reference_top_p(logits: np.ndarray, p: float) -> np.ndarray:
+    from transformers.generation.logits_process import TopPLogitsWarper
+
+    return TopPLogitsWarper(p)(None, torch.from_numpy(logits)[None, :])[0].numpy()
+
+
+# -- top-p -----------------------------------------------------------------
+
+
+def test_top_p_keeps_the_smallest_set_reaching_p():
+    # probabilities are roughly 0.64, 0.24, 0.09, 0.03
+    logits = np.array([3.0, 2.0, 1.0, 0.0], dtype=np.float32)
+    assert list(kept(top_p_filter(logits, 0.6))) == [0]
+    assert list(kept(top_p_filter(logits, 0.8))) == [0, 1]
+
+
+def test_top_p_one_disables_the_filter():
+    logits = np.array([3.0, 1.0, 2.0], dtype=np.float32)
+    np.testing.assert_array_equal(top_p_filter(logits, 1.0), logits)
+
+
+def test_top_p_always_keeps_at_least_one_token():
+    """Even a p below the largest single probability leaves the argmax."""
+    logits = np.array([10.0, 0.0, 0.0], dtype=np.float32)
+    survivors = kept(top_p_filter(logits, 1e-9))
+    assert list(survivors) == [0]
+
+
+def test_top_p_nucleus_adapts_to_confidence():
+    """The point of preferring top-p to top-k: the cut is not a fixed size."""
+    confident = np.array([20.0] + [0.0] * 99, dtype=np.float32)
+    unsure = np.zeros(100, dtype=np.float32)
+    assert len(kept(top_p_filter(confident, 0.9))) == 1
+    assert len(kept(top_p_filter(unsure, 0.9))) > 50
+
+
+def test_top_p_does_not_mutate_its_input():
+    logits = np.array([3.0, 1.0, 2.0], dtype=np.float32)
+    top_p_filter(logits, 0.5)
+    np.testing.assert_array_equal(logits, [3.0, 1.0, 2.0])
+
+
+@pytest.mark.parametrize("p", [0.0, -0.1, 1.5])
+def test_top_p_out_of_range_is_rejected(p):
+    with pytest.raises(ValueError, match="top_p must be in"):
+        top_p_filter(np.zeros(4, np.float32), p)
+
+
+@pytest.mark.reference
+def test_top_p_matches_reference_exactly_without_ties(rng):
+    """On continuous logits -- what a real model produces -- indices match.
+
+    Note the implementation accumulates ASCENDING and cuts at `<= 1 - p`,
+    mirroring the reference, rather than accumulating descending and keeping
+    until the sum reaches p. The two are algebraically identical and differ in
+    float32: for 100 equiprobable tokens at p=0.5 the descending sum reaches
+    0.4999997913837433, so one formulation keeps a token the other drops.
+    """
+    for _ in range(400):
+        n = int(rng.integers(3, 400))
+        p = float(rng.uniform(0.01, 0.999))
+        logits = (rng.standard_normal(n) * rng.uniform(0.1, 10)).astype(np.float32)
+
+        mine = top_p_filter(logits, p)
+        theirs = reference_top_p(logits, p)
+        np.testing.assert_array_equal(
+            np.isinf(mine), np.isinf(theirs), err_msg=f"n={n} p={p}"
+        )
+
+
+@pytest.mark.reference
+def test_top_p_agrees_on_size_when_ties_straddle_the_boundary(rng):
+    """With exact ties, which tied token survives is genuinely undefined.
+
+    When the nucleus boundary falls inside a group of equal logits, the
+    surviving members depend on sort order within that group -- and the
+    reference calls torch.sort with stable=False, so its own answer is
+    unspecified and may change between torch versions.
+
+    What *is* well defined, and what this asserts, is that both implementations
+    keep the same number of tokens and the same multiset of logit values. A
+    trained model does not produce exact float ties across a tied group, so
+    this case is synthetic; it is tested to document the limit of the claim
+    rather than because it can arise.
+    """
+    for _ in range(60):
+        n = int(rng.integers(4, 60))
+        logits = rng.integers(0, 3, size=n).astype(np.float32)
+        p = float(rng.uniform(0.05, 0.95))
+
+        mine = top_p_filter(logits, p)
+        theirs = reference_top_p(logits, p)
+
+        assert len(kept(mine)) == len(kept(theirs))
+        assert sorted(logits[kept(mine)]) == sorted(logits[kept(theirs)])
+
+
+def test_top_p_is_deterministic_under_ties():
+    """Our own answer must at least be stable run to run, for reproducibility."""
+    logits = np.array([1.0, 1.0, 1.0, 0.0], dtype=np.float32)
+    first = kept(top_p_filter(logits, 0.5))
+    for _ in range(5):
+        np.testing.assert_array_equal(kept(top_p_filter(logits, 0.5)), first)
