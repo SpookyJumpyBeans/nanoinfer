@@ -56,3 +56,29 @@ def apply_temperature(logits: np.ndarray, temperature: float) -> np.ndarray:
         )
 
     return (logits / np.float32(temperature)).astype(np.float32, copy=False)
+
+
+def top_k_filter(logits: np.ndarray, k: int) -> np.ndarray:
+    """Keep the ``k`` highest logits; mask the rest to ``-inf``.
+
+    ``k`` of 0 (or at least the vocabulary size) disables the filter.
+
+    The cut is "strictly below the k-th largest value", not "the first k after
+    sorting". Those differ when the k-th and (k+1)-th logits are equal: this
+    keeps both, so the surviving set can be *larger* than k. That is what the
+    reference does, and it is the defensible choice -- breaking a tie by index
+    would make the result depend on vocabulary order, which is arbitrary.
+    """
+    if k < 0:
+        raise ValueError(f"top_k must be non-negative, got {k}")
+    if k == 0 or k >= logits.shape[-1]:
+        return logits
+
+    # The k-th largest value. argpartition puts it at position -k without
+    # sorting the whole vocabulary, which matters when the vocabulary is
+    # 151,936 entries and this runs once per generated token.
+    kth_value = np.partition(logits, -k)[-k]
+
+    filtered = logits.copy()
+    filtered[logits < kth_value] = FILTER_VALUE
+    return filtered

@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from nanoinfer.sampling import apply_temperature
+from nanoinfer.sampling import apply_temperature, top_k_filter
 
 torch = pytest.importorskip("torch", reason="reference oracle not installed")
 
@@ -97,3 +97,83 @@ def test_zero_temperature_is_rejected_here(rng):
     """Zero means greedy, which is the Sampler's job, not this function's."""
     with pytest.raises(ValueError, match="greedy"):
         apply_temperature(np.zeros(4, np.float32), 0.0)
+
+
+def reference_top_k(logits: np.ndarray, k: int) -> np.ndarray:
+    from transformers.generation.logits_process import TopKLogitsWarper
+
+    return TopKLogitsWarper(k)(None, torch.from_numpy(logits)[None, :])[0].numpy()
+
+
+def kept(filtered: np.ndarray) -> np.ndarray:
+    """Indices that survived a filter."""
+    return np.flatnonzero(np.isfinite(filtered))
+
+
+# -- top-k -----------------------------------------------------------------
+
+
+def test_top_k_keeps_exactly_k_when_there_are_no_ties():
+    logits = np.array([5.0, 4.0, 3.0, 2.0, 1.0], dtype=np.float32)
+    np.testing.assert_array_equal(kept(top_k_filter(logits, 2)), [0, 1])
+
+
+def test_top_k_masks_with_negative_infinity():
+    logits = np.array([5.0, 1.0], dtype=np.float32)
+    assert top_k_filter(logits, 1)[1] == -np.inf
+
+
+def test_top_k_ties_keep_more_than_k():
+    """The cut is 'strictly below the k-th value', so ties all survive.
+
+    Breaking the tie by index would make the output depend on vocabulary
+    order, which is arbitrary. The reference makes the same choice.
+    """
+    logits = np.array([5.0, 3.0, 3.0, 3.0, 1.0], dtype=np.float32)
+    survivors = kept(top_k_filter(logits, 2))
+    assert list(survivors) == [0, 1, 2, 3]
+    assert len(survivors) > 2
+
+
+def test_top_k_zero_disables_the_filter():
+    logits = np.array([3.0, 1.0, 2.0], dtype=np.float32)
+    np.testing.assert_array_equal(top_k_filter(logits, 0), logits)
+
+
+def test_top_k_larger_than_vocab_is_a_no_op():
+    logits = np.array([3.0, 1.0, 2.0], dtype=np.float32)
+    np.testing.assert_array_equal(top_k_filter(logits, 99), logits)
+
+
+def test_top_k_one_leaves_only_the_argmax():
+    logits = np.array([1.0, 7.0, 3.0], dtype=np.float32)
+    assert list(kept(top_k_filter(logits, 1))) == [1]
+
+
+def test_top_k_does_not_mutate_its_input():
+    logits = np.array([3.0, 1.0, 2.0], dtype=np.float32)
+    top_k_filter(logits, 1)
+    np.testing.assert_array_equal(logits, [3.0, 1.0, 2.0])
+
+
+def test_negative_top_k_is_rejected():
+    with pytest.raises(ValueError, match="non-negative"):
+        top_k_filter(np.zeros(4, np.float32), -1)
+
+
+@pytest.mark.reference
+def test_top_k_matches_reference_on_random_logits(rng):
+    """Differential test, including deliberately forced ties."""
+    for trial in range(200):
+        n = int(rng.integers(5, 200))
+        k = int(rng.integers(1, n + 3))
+        logits = (rng.standard_normal(n) * rng.uniform(0.1, 8)).astype(np.float32)
+        if trial % 4 == 0:
+            logits[rng.integers(0, n, size=max(2, n // 5))] = logits[0]
+
+        mine = top_k_filter(logits, k)
+        theirs = reference_top_k(logits, k)
+        np.testing.assert_array_equal(
+            np.isinf(mine), np.isinf(theirs), err_msg=f"n={n} k={k}"
+        )
+        np.testing.assert_allclose(mine[kept(mine)], theirs[kept(theirs)], rtol=1e-6)
