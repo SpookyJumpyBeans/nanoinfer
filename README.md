@@ -21,8 +21,8 @@ The engine's entire runtime dependency list is `numpy`.
 | 3 | float32 forward pass, no cache, greedy; logits within 1e-3 of reference | **done** |
 | 4 | KV cache; identical output, measured speedup | **done** |
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
-| 6 | INT8 then INT4 quantization, perplexity delta at each level | next |
-| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | |
+| 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
+| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | next |
 | 8 | Benchmark against llama.cpp on identical hardware | |
 
 Each phase is verified against a reference implementation before the next one
@@ -256,7 +256,67 @@ Worth recording because both were confident and both were wrong:
   under 1e-6 of the probability mass and any truncation removes them, and that
   is now asserted as a number rather than described in prose.
 
-Perplexity and the llama.cpp comparison land in phases 6–8.
+### Phase 6 — quantization
+
+Perplexity on 508 tokens of held-out prose, against an fp32 baseline of 23.2690:
+
+| Level | Footprint | Perplexity | Δ | Weight error |
+|---|---:|---:|---:|---:|
+| fp32 | 1.98 GB | 23.2690 | — | — |
+| **INT8** | **0.90 GB** | **23.3078** | **+0.17%** | 0.85% |
+| INT8 + embeddings | **0.50 GB** | 23.3133 | +0.19% | 0.85% |
+| INT4, group 32 | 0.77 GB | 30.8070 | +32% | 9.9% |
+| INT4, group 128 | 0.73 GB | 35.3849 | +52% | 12.3% |
+
+**INT8 is effectively free** — a 0.17% perplexity cost for a 4× reduction on
+the weights it touches. **Naive INT4 is not.** Round-to-nearest with no error
+compensation costs half the model's quality, and that gap is precisely what
+GPTQ and AWQ exist to close; the number above is what a later attempt would
+have to beat.
+
+### Quantization cannot buy speed here, and that is measurable
+
+Phase 4 established that decode is bandwidth-bound: one token reads all 1.98 GB
+of weights at ~24 GB/s. Fewer bytes should mean a faster step. It does not,
+because NumPy has no integer GEMM:
+
+| Operation (4864×896 weight, M=1) | |
+|---|---:|
+| fp32 matmul | 0.24 ms |
+| int8 → dequantize → matmul | 20.03 ms (**82× slower**) |
+| int8 → widen → matmul → scale | 7.38 ms (30× slower) |
+
+Widening the int8 weights costs far more than the matmul it feeds. So phase 6
+delivers the **footprint** reduction, which is real, and not the bandwidth win,
+which needs a kernel that consumes integers directly — phase 7.
+
+The perplexity figures above therefore come from *simulated* quantization:
+weights are quantized and immediately dequantized, so the model computes on
+exactly the values the integer format can represent while the matmuls stay
+float32. That reproduces the arithmetic of true integer storage exactly, and is
+the standard way to measure this (PyTorch calls it a quantize-dequantize pass).
+
+### The measurement changed my mind about embeddings
+
+I excluded the embedding matrix by default, reasoning that it doubles as the
+output projection where errors land straight on the logits rather than being
+averaged over a hidden dimension first.
+
+That was wrong, and the sweep says so. Quantizing embeddings costs **0.02
+percentage points** more and saves another **0.41 GB** — and without them the
+untouched embedding matrix dominates what is left, so linear-only gets 1.98 GB
+down to 0.90 while including embeddings reaches 0.50. The flag stays, but the
+conservative default was the wrong call.
+
+### A bug the sweep caught
+
+`--group-size 32` and `--group-size 128` reported *byte-identical* perplexity.
+`quantize_model` was calling the quantizer without forwarding the group size,
+so every INT4 run silently used the default. Two configurations agreeing to the
+fourth decimal is not a coincidence, and that is what surfaced it. There is now
+a regression test asserting the two produce different stored sizes.
+
+The llama.cpp comparison lands in phase 8.
 
 ## Parameter budget
 
@@ -522,6 +582,54 @@ Draws use an inverse-CDF search rather than `rng.choice`, which is the
 definition of a multinomial draw and does not require the probabilities to sum
 to exactly 1.0 in floating point.
 
+## Quantization
+
+| | |
+|---|---|
+| [`quantization.py`](nanoinfer/quantization.py) | INT8 per-channel, INT4 group-wise, packing |
+| [`perplexity.py`](nanoinfer/perplexity.py) | the instrument the quality cost is read off |
+| [`data/heldout.txt`](data/heldout.txt) | held-out prose, committed for reproducibility |
+
+Three choices, each measured rather than asserted:
+
+**Per output channel, not per tensor.** One scale per tensor is dominated by
+its largest outlier and crushes every other row's resolution. On the real
+`gate_proj`: **4.86% error per-tensor against 0.85% per-channel.** The cost is
+one float per row — 896 floats against 802,816 weights.
+
+**Symmetric, no zero point,** so a quantized value is just `q * scale` and every
+matmul stays a plain multiply. The range is `[-127, 127]` rather than the full
+`[-128, 127]`: keeping it symmetric means a weight and its negation quantize to
+exact opposites.
+
+**Group-wise scales for INT4.** Fifteen levels is far too coarse to share one
+scale across a whole row — a single large weight at the end would flatten
+everything before it. Groups of 128 cost ~3% overhead; group 32 cuts weight
+error from 12.3% to 9.9% and perplexity from +52% to +32%.
+
+Rounding is half-away-from-zero, not `np.round`. Banker's rounding sends 0.5 to
+0, which biases small magnitudes toward zero on a symmetric grid — and small
+magnitudes are most of a weight matrix.
+
+Norms and biases are never quantized: 43,904 parameters in total, under 0.01%
+of the model, and they scale everything downstream of them.
+
+### Measuring perplexity
+
+Scored in non-overlapping chunks rather than a sliding window. A window gives a
+lower, better-looking number at many times the compute; since every precision
+level is scored identically, the delta — the actual result — is unaffected. The
+first token of each chunk is not scored, because it has no context.
+
+Log-probabilities come from a direct log-softmax rather than a log of the
+softmax, which would round small probabilities to zero and return `-inf`. The
+NLL accumulates in float64: summing a few thousand float32 terms moves the
+fourth decimal, which is exactly where the INT8 delta lives.
+
+The harness is tested against closed forms, not just against itself — a uniform
+model must score exactly the vocabulary size, and a model certain of every next
+token must score exactly 1.0.
+
 ## Two things about Qwen2.5 that will break a naive implementation
 
 **Tied embeddings.** `config.json` sets `tie_word_embeddings: true`, so there is
@@ -557,11 +665,14 @@ nanoinfer/
   model.py            SwiGLU, the block, the forward pass
   kvcache.py          pre-allocated key/value storage
   sampling.py         temperature, top-k, top-p, seeded draw
+  quantization.py     INT8 per-channel, INT4 group-wise, packing
+  perplexity.py       held-out scoring, the quality instrument
   generate.py         the decode loop, greedy or sampled
 tools/
   download_model.py   four HTTPS GETs, no huggingface_hub
   inspect_weights.py  phase 1: prove every tensor is understood
   generate.py         run the model from the command line
+  measure_quantization.py  perplexity and footprint per precision level
 bench/
   benchmark.py        append-only measurement harness
   results.jsonl       every number ever recorded
@@ -583,7 +694,13 @@ python -m bench.benchmark tokenize
 python -m bench.benchmark generate
 python -m bench.benchmark cache_ab                 # cached vs uncached, interleaved
 python -m bench.benchmark --compare
-python -m pytest                                    # 675 tests
+
+# quantization sweep, one level per process
+python -m tools.measure_quantization fp32
+python -m tools.measure_quantization int8 --quantize-embeddings
+python -m tools.measure_quantization int4 --group-size 32
+
+python -m pytest                                    # 719 tests
 ```
 
 Run the model:
