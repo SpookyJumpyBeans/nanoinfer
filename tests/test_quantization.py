@@ -9,9 +9,12 @@ import pytest
 
 from nanoinfer.quantization import (
     INT8_MAX,
+    pack_nibbles,
     quantization_error,
+    quantize_int4,
     quantize_int8,
     round_half_away_from_zero,
+    unpack_nibbles,
 )
 
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "Qwen2.5-0.5B-Instruct"
@@ -159,3 +162,70 @@ def test_real_weights_quantize_within_two_percent():
     ):
         error = quantization_error(tensor, quantize_int8(tensor).dequantize())
         assert error["rel_frobenius"] < 0.02, f"{name}: {error}"
+
+
+# -- INT4 ------------------------------------------------------------------
+
+
+def test_nibble_packing_round_trips(rng):
+    values = rng.integers(-7, 8, size=(8, 64)).astype(np.int8)
+    np.testing.assert_array_equal(unpack_nibbles(pack_nibbles(values)), values)
+
+
+def test_packing_halves_the_width():
+    values = np.zeros((4, 64), dtype=np.int8)
+    assert pack_nibbles(values).shape == (4, 32)
+    assert pack_nibbles(values).dtype == np.uint8
+
+
+def test_packing_covers_the_whole_signed_range():
+    values = np.arange(-7, 8, dtype=np.int8).reshape(1, -1)
+    values = np.pad(values, ((0, 0), (0, 1)))     # even width for packing
+    np.testing.assert_array_equal(unpack_nibbles(pack_nibbles(values)), values)
+
+
+def test_int4_shape_survives_padding(rng):
+    """An input width that is not a multiple of the group must still restore."""
+    weights = rng.standard_normal((4, 100)).astype(np.float32)
+    q = quantize_int4(weights, group_size=32)     # 100 is not a multiple of 32
+    assert q.dequantize().shape == weights.shape
+
+
+def test_int4_stores_about_eight_times_smaller(rng):
+    weights = rng.standard_normal((256, 1024)).astype(np.float32)
+    q = quantize_int4(weights, group_size=128)
+    assert 7.0 < weights.nbytes / q.nbytes < 8.0
+
+
+def test_int4_smaller_groups_are_more_accurate(rng):
+    """Fifteen levels is coarse, so how local the scale is matters a lot."""
+    weights = rng.standard_normal((32, 512)).astype(np.float32)
+    coarse = quantization_error(weights, quantize_int4(weights, 256).dequantize())
+    fine = quantization_error(weights, quantize_int4(weights, 32).dequantize())
+    assert fine["rel_frobenius"] < coarse["rel_frobenius"]
+
+
+def test_int4_is_worse_than_int8(rng):
+    """Stated explicitly: the compression is not free."""
+    weights = rng.standard_normal((64, 512)).astype(np.float32)
+    int8 = quantization_error(weights, quantize_int8(weights).dequantize())
+    int4 = quantization_error(weights, quantize_int4(weights).dequantize())
+    assert int4["rel_frobenius"] > int8["rel_frobenius"] * 5
+
+
+def test_int4_rejects_an_odd_group_size():
+    with pytest.raises(ValueError, match="even"):
+        quantize_int4(np.zeros((2, 8), np.float32), group_size=33)
+
+
+def test_int4_rejects_non_matrix_input():
+    with pytest.raises(ValueError, match="2-D"):
+        quantize_int4(np.zeros(8, dtype=np.float32))
+
+
+def test_int4_all_zero_group_does_not_divide_by_zero():
+    weights = np.zeros((2, 64), dtype=np.float32)
+    weights[1] = 1.0
+    with np.errstate(divide="raise", invalid="raise"):
+        restored = quantize_int4(weights, group_size=32).dequantize()
+    np.testing.assert_array_equal(restored[0], np.zeros(64, dtype=np.float32))
