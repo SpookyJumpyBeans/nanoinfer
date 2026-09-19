@@ -135,6 +135,124 @@ def quantization_error(original: np.ndarray, restored: np.ndarray) -> dict[str, 
     }
 
 
+# -- applying quantization to a whole model --------------------------------
+#
+# The perplexity numbers below come from *simulated* quantization: each weight
+# is quantized and immediately dequantized, so the model runs on exactly the
+# values INT8 can represent while the matmuls stay float32.
+#
+# That is not a shortcut, it is the only way to measure quality here. NumPy has
+# no integer GEMM, so genuinely holding int8 and widening per call is 30-80x
+# slower than plain float32 -- the widening costs far more than the matmul it
+# feeds. Simulated quantization reproduces the arithmetic exactly and runs at
+# full speed, which is why it is the standard way to measure this (PyTorch
+# calls the same trick a quantize-dequantize, or QDQ, pass).
+#
+# The footprint reduction is real and reported separately; the speed win is not
+# available until phase 7 replaces these matmuls with kernels that can consume
+# integers directly.
+
+LINEAR_FIELDS = (
+    "q_proj_weight",
+    "k_proj_weight",
+    "v_proj_weight",
+    "o_proj_weight",
+    "gate_proj_weight",
+    "up_proj_weight",
+    "down_proj_weight",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class QuantizationReport:
+    """What quantizing a model would cost and save."""
+
+    bits: int
+    tensors: int
+    parameters: int
+    original_bytes: int
+    quantized_bytes: int
+    embeddings_quantized: bool
+
+    @property
+    def compression(self) -> float:
+        return self.original_bytes / self.quantized_bytes
+
+    def __str__(self) -> str:
+        return (
+            f"INT{self.bits}: {self.tensors} tensors, {self.parameters:,} params, "
+            f"{self.original_bytes / 1e9:.2f} GB -> {self.quantized_bytes / 1e9:.2f} GB "
+            f"({self.compression:.2f}x)"
+            + ("" if self.embeddings_quantized else ", embeddings left at fp32")
+        )
+
+
+def quantize_model(
+    weights,
+    bits: int = 8,
+    quantize_embeddings: bool = False,
+    group_size: int = INT4_GROUP_SIZE,
+):
+    """Return a copy of ``weights`` with its linear layers quantized.
+
+    ``quantize_embeddings`` is off by default. The embedding matrix is 27.6% of
+    this model's parameters, so including it is tempting -- but it does double
+    duty as the output projection, where its errors land directly on the logits
+    rather than being averaged over a hidden dimension first. It is offered as
+    a flag so the cost can be measured rather than assumed.
+
+    Norm weights and biases are never quantized. They are 43,904 parameters in
+    total, under 0.01% of the model, and they scale everything downstream of
+    them; there is nothing to win and real accuracy to lose.
+    """
+    import dataclasses
+
+    if bits not in (4, 8):
+        raise ValueError(f"only INT4 and INT8 are implemented, got {bits}")
+
+    if bits == 8:
+        def quantizer(tensor):
+            return quantize_int8(tensor)
+    else:
+        def quantizer(tensor):
+            return quantize_int4(tensor, group_size=group_size)
+
+    tensors = 0
+    parameters = 0
+    original_bytes = 0
+    quantized_bytes = 0
+
+    def convert(tensor: np.ndarray) -> np.ndarray:
+        nonlocal tensors, parameters, original_bytes, quantized_bytes
+        packed = quantizer(tensor)
+        tensors += 1
+        parameters += tensor.size
+        original_bytes += tensor.nbytes
+        quantized_bytes += packed.nbytes
+        return packed.dequantize()
+
+    new_layers = []
+    for layer in weights.layers:
+        replacements = {field: convert(getattr(layer, field)) for field in LINEAR_FIELDS}
+        new_layers.append(dataclasses.replace(layer, **replacements))
+
+    embed = convert(weights.embed_tokens) if quantize_embeddings else weights.embed_tokens
+
+    quantized = dataclasses.replace(
+        weights, layers=tuple(new_layers), embed_tokens=embed
+    )
+
+    report = QuantizationReport(
+        bits=bits,
+        tensors=tensors,
+        parameters=parameters,
+        original_bytes=original_bytes,
+        quantized_bytes=quantized_bytes,
+        embeddings_quantized=quantize_embeddings,
+    )
+    return quantized, report
+
+
 # -- INT4 ------------------------------------------------------------------
 
 

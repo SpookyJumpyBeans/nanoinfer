@@ -229,3 +229,62 @@ def test_int4_all_zero_group_does_not_divide_by_zero():
     with np.errstate(divide="raise", invalid="raise"):
         restored = quantize_int4(weights, group_size=32).dequantize()
     np.testing.assert_array_equal(restored[0], np.zeros(64, dtype=np.float32))
+
+
+# -- whole-model quantization ----------------------------------------------
+
+
+@pytest.mark.skipif(not HAVE_MODEL, reason="model not downloaded")
+@pytest.mark.slow
+def test_quantize_model_leaves_norms_and_biases_alone():
+    from nanoinfer.quantization import quantize_model
+    from nanoinfer.weights import ModelWeights
+
+    original = ModelWeights.load(MODEL_DIR)
+    quantized, report = quantize_model(original, bits=8)
+
+    # 24 layers x 7 linear tensors.
+    assert report.tensors == 24 * 7
+    np.testing.assert_array_equal(
+        quantized.layers[0].input_layernorm, original.layers[0].input_layernorm
+    )
+    np.testing.assert_array_equal(
+        quantized.layers[0].q_proj_bias, original.layers[0].q_proj_bias
+    )
+
+
+@pytest.mark.skipif(not HAVE_MODEL, reason="model not downloaded")
+@pytest.mark.slow
+def test_quantize_model_leaves_embeddings_alone_by_default():
+    from nanoinfer.quantization import quantize_model
+    from nanoinfer.weights import ModelWeights
+
+    original = ModelWeights.load(MODEL_DIR)
+    quantized, report = quantize_model(original, bits=8)
+
+    assert not report.embeddings_quantized
+    np.testing.assert_array_equal(quantized.embed_tokens, original.embed_tokens)
+
+
+@pytest.mark.skipif(not HAVE_MODEL, reason="model not downloaded")
+@pytest.mark.slow
+def test_group_size_actually_reaches_the_quantizer():
+    """Regression: the flag was accepted and silently ignored.
+
+    Both group sizes produced byte-identical results, which is how the bug
+    surfaced -- the measurement sweep reported the same perplexity twice.
+    """
+    from nanoinfer.quantization import quantize_model
+    from nanoinfer.weights import ModelWeights
+
+    original = ModelWeights.load(MODEL_DIR)
+    _, coarse = quantize_model(original, bits=4, group_size=128)
+    _, fine = quantize_model(original, bits=4, group_size=32)
+    assert fine.quantized_bytes > coarse.quantized_bytes
+
+
+def test_quantize_model_rejects_unsupported_widths():
+    from nanoinfer.quantization import quantize_model
+
+    with pytest.raises(ValueError, match="only INT4 and INT8"):
+        quantize_model(None, bits=16)
