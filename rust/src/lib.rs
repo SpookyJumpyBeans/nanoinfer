@@ -60,3 +60,71 @@ pub fn pseudo_random(n: usize, seed: u64) -> Vec<f32> {
         })
         .collect()
 }
+
+/// Row-major int8 weights with one float32 scale per row, times a vector.
+///
+/// This is the kernel phase 6 could not write in NumPy. The int8 is widened to
+/// f32 *inside the loop*, one value at a time, so the widened weights exist
+/// only in registers. Nothing the size of the weight matrix is ever allocated,
+/// and the bytes actually read from memory are a quarter of the fp32 version.
+///
+/// The scale is applied once per row, to the finished dot product, rather than
+/// per element. That is algebraically the same -- `sum(s * q_i * x_i)` is
+/// `s * sum(q_i * x_i)` -- and it turns `in_features` multiplies into one.
+/// It is not bit-identical to scaling per element, because float addition is
+/// not associative; it is the more accurate order, since the accumulation
+/// happens before the magnitudes are rescaled.
+pub fn matvec_i8(quantized: &[i8], scales: &[f32], x: &[f32], out: &mut [f32]) {
+    let in_features = x.len();
+    assert_eq!(
+        quantized.len(),
+        out.len() * in_features,
+        "weight shape mismatch"
+    );
+    assert_eq!(scales.len(), out.len(), "expected one scale per output row");
+
+    for (row, y) in out.iter_mut().enumerate() {
+        let start = row * in_features;
+        let w = &quantized[start..start + in_features];
+
+        let mut sum = 0.0f32;
+        for i in 0..in_features {
+            // The widening that NumPy has to do to a whole array, done here to
+            // a single value that never leaves the register file.
+            sum += (w[i] as f32) * x[i];
+        }
+        *y = sum * scales[row];
+    }
+}
+
+/// Quantize a row-major `[out, in]` float32 matrix to symmetric per-row int8.
+///
+/// Mirrors `nanoinfer.quantization.quantize_int8` exactly, including the
+/// [-127, 127] range and rounding half away from zero, so the Rust and Python
+/// sides agree on what the stored integers should be. Tests compare them.
+pub fn quantize_rows_i8(weights: &[f32], out_features: usize) -> (Vec<i8>, Vec<f32>) {
+    let in_features = weights.len() / out_features;
+    let mut quantized = vec![0i8; weights.len()];
+    let mut scales = vec![0.0f32; out_features];
+
+    for row in 0..out_features {
+        let start = row * in_features;
+        let w = &weights[start..start + in_features];
+
+        let magnitude = w.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        // An all-zero row would divide by zero; any scale reconstructs zeros.
+        let scale = if magnitude == 0.0 { 1.0 } else { magnitude / 127.0 };
+        scales[row] = scale;
+
+        for i in 0..in_features {
+            let scaled = w[i] / scale;
+            // Round half away from zero, matching the Python side. Rust's
+            // f32::round already does this; it is named here because the
+            // NumPy default (banker's rounding) does not.
+            let rounded = scaled.round();
+            quantized[start + i] = rounded.clamp(-127.0, 127.0) as i8;
+        }
+    }
+
+    (quantized, scales)
+}
