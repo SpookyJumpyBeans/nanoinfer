@@ -22,8 +22,8 @@ The engine's entire runtime dependency list is `numpy`.
 | 4 | KV cache; identical output, measured speedup | **done** |
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
-| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | next |
-| 8 | Benchmark against llama.cpp on identical hardware | |
+| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done**, WebGPU not started |
+| 8 | Benchmark against llama.cpp on identical hardware | next |
 
 Each phase is verified against a reference implementation before the next one
 starts. Correctness first; a fast wrong answer teaches nothing.
@@ -315,6 +315,71 @@ conservative default was the wrong call.
 so every INT4 run silently used the default. Two configurations agreeing to the
 fourth decimal is not a coincidence, and that is what surfaced it. There is now
 a regression test asserting the two produce different stored sizes.
+
+### Phase 7 — Rust kernels on the CPU
+
+Phase 6 ended with a footprint win and no speed win: NumPy has no integer GEMM,
+so holding int8 and widening per call is 30–80× *slower* than float32. The
+kernel that consumes integers directly is what phase 7 builds.
+
+The crate is a cdylib reached over ctypes; the engine is still NumPy and still
+runs without it. Per layer, projections only, best of 50, alternating A/B:
+
+| | numpy fp32 | rust 1 thread | rust pooled |
+|---|---:|---:|---:|
+| busy machine | 1.902 ms | 3.521 ms | **1.562 ms** |
+| quiet machine | 0.967 ms | 1.814 ms | **0.762 ms** |
+| | — | 0.53× | **1.22× / 1.27×** |
+
+**1.2×, not 10×.** The Rust crate's own benchmark shows 10.28× — against the
+crate's own scalar loop, which is a fair baseline for judging SIMD and a
+meaningless one for judging the project. The engine never ran a scalar loop; it
+ran OpenBLAS on twenty cores, and OpenBLAS is very good. Beating it by 22% with
+hand-written AVX2 and a thread pool is the honest result.
+
+Single-threaded loses outright at 0.53×. The SIMD is not what wins here.
+
+### The bug that made parallelism look like a bad idea
+
+Output rows are independent — row *j* reads its own slice of the weights and
+writes one float — so splitting them needs no synchronisation at all. The first
+implementation of that was **12× slower than one thread**: 1.19 ms against
+0.094 ms on a 896×896 matvec.
+
+The decomposition was never wrong. `std::thread::scope` creates real OS threads
+at the scope and destroys them at its end, so every call paid to construct
+twenty threads for ~90 µs of work. Moving to a pool whose workers already exist
+— the only change — took the same code from 3.453 ms to 0.798 ms per layer.
+
+Both kernels are still in the crate. `matvec_i8_spawn_per_call` is tested for
+bitwise agreement with the good one, so the benchmark compares two correct
+implementations rather than a good one against a broken one.
+
+That is also why the crate has exactly one dependency. A pool whose workers can
+borrow the caller's slices needs either unsafe lifetime laundering or rayon's
+scope, and the no-dependency version I wrote to avoid it is the 4–7×-slower
+column.
+
+### Two projections are slower in Rust, and that is not noise
+
+`k_proj` and `v_proj` measure **0.32×** — a loss — in both runs.
+
+They are 128 rows, about 10 µs of work. The ctypes boundary has a floor of
+roughly 8 µs per call, measured on a 1×1 matvec where there is nothing left but
+the boundary itself. Below that floor, calling Rust costs more than the work,
+and no kernel improvement can fix it; the call has to be made bigger, or not
+made at all.
+
+### What phase 7 did not do
+
+The brief says "Rust port". This is not a port — the engine is still NumPy, and
+only the seven linear projections cross into Rust. Attention, the norms, RoPE
+and the LM head are untouched. Scaled to a token that is 45.7 → 37.5 ms of
+projection time, which is a ceiling on what these kernels can move rather than
+a token rate.
+
+**WebGPU is not started.** Phase 7 was scoped as CPU SIMD first, then compute
+shaders; the CPU half is done and measured, and the GPU half is not begun.
 
 The llama.cpp comparison lands in phase 8.
 
@@ -667,15 +732,23 @@ nanoinfer/
   sampling.py         temperature, top-k, top-p, seeded draw
   quantization.py     INT8 per-channel, INT4 group-wise, packing
   perplexity.py       held-out scoring, the quality instrument
+  kernels.py          ctypes bridge to the Rust kernels, optional
   generate.py         the decode loop, greedy or sampled
 tools/
   download_model.py   four HTTPS GETs, no huggingface_hub
   inspect_weights.py  phase 1: prove every tensor is understood
   generate.py         run the model from the command line
   measure_quantization.py  perplexity and footprint per precision level
+  bench_kernels.py    rust kernels against OpenBLAS, alternating A/B
+rust/
+  src/lib.rs          fp32 and int8 matvecs, AVX2, thread pool, C ABI
+  src/bin/bench.rs    the same kernels against this crate's scalar loop
+  tests/matvec.rs     arithmetic; the boundary is tested from Python
 bench/
   benchmark.py        append-only measurement harness
   results.jsonl       every number ever recorded
+  quantization.jsonl  perplexity and footprint per precision level
+  kernels.jsonl       kernel timings, rust against numpy
 tests/
   corpus.py           the seeded 10,000-string differential corpus
   tiny.py             a 4,000-parameter model built on the fly for tests
@@ -699,6 +772,10 @@ python -m bench.benchmark --compare
 python -m tools.measure_quantization fp32
 python -m tools.measure_quantization int8 --quantize-embeddings
 python -m tools.measure_quantization int4 --group-size 32
+
+# rust kernels; entirely optional, the engine runs without them
+cd rust && cargo test --release && cargo run --release --bin bench
+cd .. && python -m tools.bench_kernels
 
 python -m pytest                                    # 719 tests
 ```
