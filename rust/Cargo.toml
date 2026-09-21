@@ -5,6 +5,13 @@ edition = "2021"
 description = "Hot-loop kernels for nanoinfer: the matvecs NumPy cannot do well"
 license = "MIT"
 
+[dependencies]
+# A persistent thread pool. std::thread::scope spawns fresh OS threads per
+# call, which for a matvec measured in microseconds costs an order of
+# magnitude more than the work -- measured at 1.19 ms against 0.09 ms
+# single-threaded. Rayon keeps its workers alive between calls.
+rayon = "1"
+
 [lib]
 name = "nanoinfer_kernels"
 # `lib` for the Rust tests and bench, `cdylib` so Python can load it via ctypes

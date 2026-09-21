@@ -20,8 +20,14 @@ fn best_of<F: FnMut()>(mut f: F, runs: usize) -> f64 {
 }
 
 fn main() {
-    println!("{:<22} {:>10} {:>10} {:>10} {:>9}", "shape", "fp32 ms", "i8 ms", "i8+avx2", "speedup");
-    println!("{}", "-".repeat(66));
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    println!("one core against {cores}, best of 50
+");
+    println!(
+        "{:<22} {:>9} {:>9} {:>10} {:>9} {:>9}",
+        "shape", "fp32 ms", "i8+avx2", "mt spawn", "mt pool", "vs fp32"
+    );
+    println!("{}", "-".repeat(74));
 
     // Every linear layer Qwen2.5-0.5B runs per decoded token.
     let shapes: &[(&str, usize, usize)] = &[
@@ -34,7 +40,9 @@ fn main() {
     ];
 
     let mut total_f32 = 0.0;
-    let mut total_avx = 0.0;
+    let mut total_one = 0.0;
+    let mut total_spawn = 0.0;
+    let mut total_pool = 0.0;
 
     for (name, out_features, in_features) in shapes {
         let weights = pseudo_random(out_features * in_features, 21);
@@ -44,28 +52,47 @@ fn main() {
 
         let runs = 50;
         let f32_ms = best_of(|| matvec_f32(&weights, &x, &mut out), runs);
-        let i8_ms = best_of(|| matvec_i8(&quantized, &scales, &x, &mut out), runs);
         let avx_ms = best_of(|| matvec_i8_auto(&quantized, &scales, &x, &mut out), runs);
+        let spawn_ms = best_of(
+            || matvec_i8_spawn_per_call(&quantized, &scales, &x, &mut out, 0),
+            runs,
+        );
+        let pool_ms = best_of(
+            || matvec_i8_parallel(&quantized, &scales, &x, &mut out),
+            runs,
+        );
 
         total_f32 += f32_ms;
-        total_avx += avx_ms;
+        total_one += avx_ms;
+        total_spawn += spawn_ms;
+        total_pool += pool_ms;
 
         println!(
-            "{name:<22} {f32_ms:>10.3} {i8_ms:>10.3} {avx_ms:>10.3} {:>8.2}x",
-            f32_ms / avx_ms
+            "{name:<22} {f32_ms:>9.3} {avx_ms:>9.3} {spawn_ms:>10.3} {pool_ms:>9.3} {:>8.2}x",
+            f32_ms / pool_ms
         );
     }
 
-    println!("{}", "-".repeat(66));
+    println!("{}", "-".repeat(74));
     println!(
-        "{:<22} {total_f32:>10.3} {:>10} {total_avx:>10.3} {:>8.2}x",
+        "{:<22} {total_f32:>9.3} {total_one:>9.3} {total_spawn:>10.3} {total_pool:>9.3} {:>8.2}x",
         "one layer total",
-        "",
-        total_f32 / total_avx
+        total_f32 / total_pool
     );
     println!(
-        "\n24 layers: fp32 {:.1} ms, int8+avx2 {:.1} ms per decoded token",
+        "
+NOTE: the fp32 column is this crate's scalar loop, not OpenBLAS.
+         Compare against numpy with: python -m tools.bench_kernels"
+    );
+    println!(
+        "
+24 layers: fp32 {:.1} ms, int8+avx2 {:.1} ms, +pool {:.1} ms per decoded token",
         total_f32 * 24.0,
-        total_avx * 24.0
+        total_one * 24.0,
+        total_pool * 24.0
+    );
+    println!(
+        "spawning threads per call costs {:.1}x against the same work on a pool",
+        total_spawn / total_pool
     );
 }

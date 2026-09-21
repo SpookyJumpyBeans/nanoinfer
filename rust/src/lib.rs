@@ -207,3 +207,107 @@ pub unsafe fn matvec_i8_avx2(quantized: &[i8], scales: &[f32], x: &[f32], out: &
         *y = sum * scales[row];
     }
 }
+
+// -- multithreading --------------------------------------------------------
+//
+use rayon::prelude::*;
+
+// The single-threaded AVX2 kernel loses to OpenBLAS by about 2.75x, and
+// OpenBLAS is using every core. Output rows are completely independent -- row
+// j reads its own slice of the weights and writes one float -- so the work
+// splits with no synchronisation beyond the join, and no locking at all.
+//
+// That reasoning is correct and the first implementation of it was still 12x
+// slower than one thread. Both kernels are kept below, because the gap between
+// them is the whole lesson: the parallelism was never the problem, the thread
+// *lifetime* was.
+
+/// Parallel int8 matvec that spawns fresh threads on every call.
+///
+/// Kept, and benchmarked, because it is the obvious implementation and it is
+/// dramatically wrong. `std::thread::scope` creates real OS threads at the
+/// scope and joins them at its end, so every call pays the full construction
+/// and teardown of one thread per worker. A 896x896 matvec takes ~90us of
+/// actual work; spawning 20 threads to do it measured **1.19 ms**, an order of
+/// magnitude worse than not parallelising at all.
+///
+/// Use [`matvec_i8_parallel`] instead. This exists so `bench` can show the
+/// difference rather than assert it.
+pub fn matvec_i8_spawn_per_call(
+    quantized: &[i8],
+    scales: &[f32],
+    x: &[f32],
+    out: &mut [f32],
+    threads: usize,
+) {
+    let in_features = x.len();
+    let out_features = out.len();
+    assert_eq!(quantized.len(), out_features * in_features, "weight shape mismatch");
+    assert_eq!(scales.len(), out_features, "expected one scale per output row");
+
+    let threads = if threads == 0 {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    } else {
+        threads
+    };
+
+    if threads <= 1 || out_features < threads * 8 {
+        return matvec_i8_auto(quantized, scales, x, out);
+    }
+
+    let rows_per_thread = out_features.div_ceil(threads);
+
+    std::thread::scope(|scope| {
+        let mut remaining_out = out;
+        let mut row_start = 0;
+
+        while row_start < out_features {
+            let block = rows_per_thread.min(out_features - row_start);
+            let (chunk, rest) = remaining_out.split_at_mut(block);
+            remaining_out = rest;
+
+            let weights = &quantized[row_start * in_features..(row_start + block) * in_features];
+            let block_scales = &scales[row_start..row_start + block];
+
+            scope.spawn(move || matvec_i8_auto(weights, block_scales, x, chunk));
+            row_start += block;
+        }
+    });
+}
+
+/// Parallel int8 matvec over a persistent worker pool.
+///
+/// Identical decomposition to [`matvec_i8_spawn_per_call`] -- contiguous
+/// blocks of output rows, which keeps each worker's weight reads sequential,
+/// the access pattern this is bandwidth-bound on. The only difference is that
+/// rayon's workers already exist and are parked, so a call costs a wakeup
+/// rather than a `CreateThread`.
+///
+/// That single change is the entire fix, and it is why the crate has one
+/// dependency: writing a correct pool that can borrow the caller's slices
+/// needs either unsafe lifetime transmutation or rayon's scope, and the
+/// no-dependency version measured above is not a real alternative.
+pub fn matvec_i8_parallel(quantized: &[i8], scales: &[f32], x: &[f32], out: &mut [f32]) {
+    let in_features = x.len();
+    let out_features = out.len();
+    assert_eq!(quantized.len(), out_features * in_features, "weight shape mismatch");
+    assert_eq!(scales.len(), out_features, "expected one scale per output row");
+
+    let threads = rayon::current_num_threads();
+
+    // Under this, the wakeup still costs more than the rows would.
+    if threads <= 1 || out_features < threads * 8 {
+        return matvec_i8_auto(quantized, scales, x, out);
+    }
+
+    let rows_per_thread = out_features.div_ceil(threads);
+
+    out.par_chunks_mut(rows_per_thread)
+        .enumerate()
+        .for_each(|(block_index, chunk)| {
+            let row_start = block_index * rows_per_thread;
+            let weights = &quantized[row_start * in_features..(row_start + chunk.len()) * in_features];
+            let block_scales = &scales[row_start..row_start + chunk.len()];
+            matvec_i8_auto(weights, block_scales, x, chunk);
+        });
+}

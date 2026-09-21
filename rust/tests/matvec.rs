@@ -176,3 +176,49 @@ fn simd_handles_a_ragged_tail() {
         assert!((a - b).abs() < a.abs().max(1.0) * 1e-4, "{a} vs {b}");
     }
 }
+
+use nanoinfer_kernels::{matvec_i8_parallel, matvec_i8_spawn_per_call};
+
+#[test]
+fn parallel_agrees_with_single_threaded() {
+    for &(out_features, in_features) in &[(64, 896), (4864, 896), (896, 4864), (7, 128)] {
+        let weights = pseudo_random(out_features * in_features, 31);
+        let x = pseudo_random(in_features, 32);
+        let (quantized, scales) = quantize_rows_i8(&weights, out_features);
+
+        let mut single = vec![0.0; out_features];
+        matvec_i8_auto(&quantized, &scales, &x, &mut single);
+
+        let mut parallel = vec![0.0; out_features];
+        matvec_i8_parallel(&quantized, &scales, &x, &mut parallel);
+        // Each row is computed entirely by one thread, so splitting rows
+        // changes nothing about the arithmetic: this one IS bitwise.
+        assert_eq!(single, parallel, "pooled, shape={out_features}x{in_features}");
+
+        // The slow implementation has to agree too, or the benchmark would be
+        // comparing a correct kernel against a broken one.
+        for threads in [1, 2, 4, 0] {
+            let mut spawned = vec![0.0; out_features];
+            matvec_i8_spawn_per_call(&quantized, &scales, &x, &mut spawned, threads);
+            assert_eq!(
+                single, spawned,
+                "threads={threads} shape={out_features}x{in_features}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_small_matrix_falls_back_rather_than_spawning() {
+    // 7 rows across 20 threads would be mostly join overhead.
+    let weights = pseudo_random(7 * 64, 33);
+    let x = pseudo_random(64, 34);
+    let (quantized, scales) = quantize_rows_i8(&weights, 7);
+
+    let mut expected = vec![0.0; 7];
+    matvec_i8_auto(&quantized, &scales, &x, &mut expected);
+    let mut actual = vec![0.0; 7];
+    matvec_i8_parallel(&quantized, &scales, &x, &mut actual);
+
+    assert_eq!(expected, actual);
+}
