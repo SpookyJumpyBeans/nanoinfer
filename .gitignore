@@ -16,3 +16,4 @@ dist/
 # Benchmark output is kept (it is the point), but scratch files are not
 bench/*.tmp
 scratch/
+rust/target/
