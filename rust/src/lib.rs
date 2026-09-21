@@ -311,3 +311,80 @@ pub fn matvec_i8_parallel(quantized: &[i8], scales: &[f32], x: &[f32], out: &mut
             matvec_i8_auto(weights, block_scales, x, chunk);
         });
 }
+
+// -- C ABI --------------------------------------------------------------
+//
+// The engine is NumPy, so the kernels have to be reachable from Python. This
+// is ctypes against a cdylib rather than PyO3: the whole surface is four
+// pointers and two lengths, PyO3 would add a build step and a compiled
+// extension per Python version, and ctypes needs neither.
+//
+// Everything here is unsafe by nature -- the caller passes raw pointers and
+// asserts the lengths. The Python side owns that contract and checks shapes
+// before it calls; see nanoinfer/kernels.py.
+
+/// Runtime CPU feature report, so Python can say which kernel it got.
+///
+/// Returns 1 if the AVX2 path is live, 0 if this build fell back to scalar.
+#[no_mangle]
+pub extern "C" fn nanoinfer_has_avx2() -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        i32::from(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
+/// Number of worker threads the parallel kernel will use.
+#[no_mangle]
+pub extern "C" fn nanoinfer_num_threads() -> i32 {
+    rayon::current_num_threads() as i32
+}
+
+/// int8 matvec over the thread pool. `out` must have room for `out_features`.
+///
+/// # Safety
+/// `quantized` must point to `out_features * in_features` readable bytes,
+/// `scales` to `out_features` floats, `x` to `in_features` floats, and `out`
+/// to `out_features` writable floats. No aliasing between `out` and the rest.
+#[no_mangle]
+pub unsafe extern "C" fn nanoinfer_matvec_i8(
+    quantized: *const i8,
+    scales: *const f32,
+    x: *const f32,
+    out: *mut f32,
+    out_features: usize,
+    in_features: usize,
+) {
+    let quantized = std::slice::from_raw_parts(quantized, out_features * in_features);
+    let scales = std::slice::from_raw_parts(scales, out_features);
+    let x = std::slice::from_raw_parts(x, in_features);
+    let out = std::slice::from_raw_parts_mut(out, out_features);
+    matvec_i8_parallel(quantized, scales, x, out);
+}
+
+/// Single-threaded int8 matvec, same contract as [`nanoinfer_matvec_i8`].
+///
+/// Exposed so the Python benchmark can separate the SIMD win from the
+/// threading win rather than reporting one number for both.
+///
+/// # Safety
+/// As [`nanoinfer_matvec_i8`].
+#[no_mangle]
+pub unsafe extern "C" fn nanoinfer_matvec_i8_single(
+    quantized: *const i8,
+    scales: *const f32,
+    x: *const f32,
+    out: *mut f32,
+    out_features: usize,
+    in_features: usize,
+) {
+    let quantized = std::slice::from_raw_parts(quantized, out_features * in_features);
+    let scales = std::slice::from_raw_parts(scales, out_features);
+    let x = std::slice::from_raw_parts(x, in_features);
+    let out = std::slice::from_raw_parts_mut(out, out_features);
+    matvec_i8_auto(quantized, scales, x, out);
+}
