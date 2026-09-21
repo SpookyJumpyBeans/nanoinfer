@@ -128,3 +128,82 @@ pub fn quantize_rows_i8(weights: &[f32], out_features: usize) -> (Vec<i8>, Vec<f
 
     (quantized, scales)
 }
+
+// -- AVX2 ------------------------------------------------------------------
+//
+// The scalar kernel already reads a quarter of the bytes, which is the point.
+// AVX2 is about whether the widening itself can keep up: eight int8 values are
+// sign-extended to i32, converted to f32, and fused-multiply-added against the
+// activations in a handful of instructions, rather than one conversion per
+// element.
+//
+// Availability is checked at runtime rather than assumed at compile time. This
+// laptop is Alder Lake, so AVX2 yes and AVX-512 no -- but a binary that crashes
+// on an older machine is worse than one that is slightly slower everywhere, and
+// the dispatch costs one predictable branch per call.
+
+/// Dispatches to the AVX2 kernel when the CPU has it, else the scalar one.
+pub fn matvec_i8_auto(quantized: &[i8], scales: &[f32], x: &[f32], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by the runtime feature check above, and the
+            // shape assertions inside match the scalar kernel's.
+            unsafe { return matvec_i8_avx2(quantized, scales, x, out) }
+        }
+    }
+    matvec_i8(quantized, scales, x, out)
+}
+
+/// AVX2 + FMA int8 matvec.
+///
+/// # Safety
+/// The caller must ensure AVX2 and FMA are available; use `matvec_i8_auto`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn matvec_i8_avx2(quantized: &[i8], scales: &[f32], x: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    let in_features = x.len();
+    assert_eq!(quantized.len(), out.len() * in_features, "weight shape mismatch");
+    assert_eq!(scales.len(), out.len(), "expected one scale per output row");
+
+    let chunks = in_features / 8;
+    let tail = chunks * 8;
+
+    for (row, y) in out.iter_mut().enumerate() {
+        let w = quantized.as_ptr().add(row * in_features);
+
+        let mut acc = _mm256_setzero_ps();
+        for chunk in 0..chunks {
+            let offset = chunk * 8;
+
+            // Eight int8 -> eight i32 (sign-extended) -> eight f32. The whole
+            // widening happens in registers; no array is ever materialised.
+            let packed = _mm_loadl_epi64(w.add(offset) as *const __m128i);
+            let widened = _mm256_cvtepi8_epi32(packed);
+            let weights = _mm256_cvtepi32_ps(widened);
+
+            let activations = _mm256_loadu_ps(x.as_ptr().add(offset));
+            acc = _mm256_fmadd_ps(weights, activations, acc);
+        }
+
+        // Horizontal sum of the eight lanes. Done once per row, so its cost is
+        // amortised over in_features multiply-adds.
+        let high = _mm256_extractf128_ps(acc, 1);
+        let low = _mm256_castps256_ps128(acc);
+        let mut sum128 = _mm_add_ps(low, high);
+        sum128 = _mm_hadd_ps(sum128, sum128);
+        sum128 = _mm_hadd_ps(sum128, sum128);
+        let mut sum = _mm_cvtss_f32(sum128);
+
+        // Whatever did not fill a lane. in_features is 896 or 4864 for this
+        // model, both multiples of 8, so this is empty in practice -- but a
+        // kernel that silently drops the tail is a trap for the next shape.
+        for i in tail..in_features {
+            sum += (*w.add(i) as f32) * x[i];
+        }
+
+        *y = sum * scales[row];
+    }
+}

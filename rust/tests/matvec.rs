@@ -131,3 +131,48 @@ fn rejects_a_missing_scale() {
     let mut out = [0.0; 2];
     matvec_i8(&[1, 2, 3, 4], &[1.0], &[1.0, 1.0], &mut out);
 }
+
+use nanoinfer_kernels::matvec_i8_auto;
+
+#[test]
+fn simd_and_scalar_agree() {
+    // Not bit-identical: the SIMD version accumulates in eight lanes and sums
+    // them at the end, so the additions happen in a different order. Float
+    // addition is not associative, so the tolerance is real, not laziness.
+    for &(out_features, in_features) in &[(1, 8), (3, 896), (64, 4864), (5, 17)] {
+        let weights = pseudo_random(out_features * in_features, 11);
+        let x = pseudo_random(in_features, 12);
+        let (quantized, scales) = quantize_rows_i8(&weights, out_features);
+
+        let mut scalar = vec![0.0; out_features];
+        matvec_i8(&quantized, &scales, &x, &mut scalar);
+
+        let mut simd = vec![0.0; out_features];
+        matvec_i8_auto(&quantized, &scales, &x, &mut simd);
+
+        for (a, b) in scalar.iter().zip(&simd) {
+            let tolerance = a.abs().max(1.0) * 1e-4;
+            assert!(
+                (a - b).abs() < tolerance,
+                "scalar {a} vs simd {b} at shape {out_features}x{in_features}"
+            );
+        }
+    }
+}
+
+#[test]
+fn simd_handles_a_ragged_tail() {
+    // 17 is not a multiple of 8, so the tail loop has to run.
+    let weights = pseudo_random(4 * 17, 13);
+    let x = pseudo_random(17, 14);
+    let (quantized, scales) = quantize_rows_i8(&weights, 4);
+
+    let mut scalar = vec![0.0; 4];
+    matvec_i8(&quantized, &scales, &x, &mut scalar);
+    let mut simd = vec![0.0; 4];
+    matvec_i8_auto(&quantized, &scales, &x, &mut simd);
+
+    for (a, b) in scalar.iter().zip(&simd) {
+        assert!((a - b).abs() < a.abs().max(1.0) * 1e-4, "{a} vs {b}");
+    }
+}
