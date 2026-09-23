@@ -23,7 +23,7 @@ The engine's entire runtime dependency list is `numpy`.
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
 | 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done**, WebGPU not started |
-| 8 | Benchmark against llama.cpp on identical hardware | next |
+| 8 | Benchmark against llama.cpp on identical hardware | **reference verified**, timings next |
 
 Each phase is verified against a reference implementation before the next one
 starts. Correctness first; a fast wrong answer teaches nothing.
@@ -381,7 +381,64 @@ a token rate.
 **WebGPU is not started.** Phase 7 was scoped as CPU SIMD first, then compute
 shaders; the CPU half is done and measured, and the GPU half is not begun.
 
-The llama.cpp comparison lands in phase 8.
+### Phase 8 — llama.cpp as a reference
+
+Before timing this engine against llama.cpp, the two have to be computing the
+same thing. They are:
+
+| | |
+|---|---|
+| tokenizer | **5/5** prompts, exact token ids |
+| generation | **5/5** prompts, 64 greedy tokens each, exact |
+
+320 consecutive argmax decisions agreeing across two implementations that share
+no code. That is not a claim the logits are bitwise equal — they are not, and
+phase 3 put the floor on that at ~1e-5 — only that nothing ever moved an
+argmax.
+
+**Same weights, not merely the same model.** The GGUF is converted from the
+exact safetensors file this engine loads, at f32, by llama.cpp's own
+`convert_hf_to_gguf.py`. It lands at 1.98 GB across 290 tensors, which is the
+same footprint phase 4 measured, and its 151,387 merges match this tokenizer's
+exactly. Downloading a prebuilt GGUF would have smuggled in someone else's
+conversion and quantization decisions as an uncontrolled variable.
+
+### The phase 3 bug, in a second engine, by a different route
+
+llama.cpp's `--help` documents `--repeat-penalty` as defaulting to 1.00. Asked
+to report what it actually used, it prints:
+
+```
+repeat_penalty = 1.100, top_p = 0.800, min_p = 0.050
+```
+
+The model file wins. `convert_hf_to_gguf.py` copies `generation_config.json`
+into the GGUF metadata, so Qwen2.5's own `repetition_penalty: 1.1` and
+`top_p: 0.8` arrive *with the weights* and silently override the flag defaults.
+Leaving the flag off changes the continuation from "Paris. It is the largest
+city…" to "Paris. It was founded in 789 AD…".
+
+Phase 3 hit precisely this bug from the other side — the transformers reference
+diverged until `repetition_penalty` was forced to 1.0. Same trap, different
+path, and the reason every sampler that could move an argmax is now pinned
+explicitly rather than inherited.
+
+### Building llama.cpp on Windows, for whoever needs it next
+
+Four fixes, none of them in llama.cpp's code, all of them specific to a MinGW
+build driven from MSYS `make`:
+
+| Symptom | Cause |
+|---|---|
+| `Cannot create temporary file in C:\WINDOWS` | MSYS `make` strips `TMP`/`TEMP`/`TMPDIR` from every recipe, so GCC falls back to Windows' default of `C:\WINDOWS`, which is not writable |
+| same error, but only at link time | `CMAKE_*_COMPILER_LAUNCHER` covers compiling, not linking; `CMAKE_*_LINKER_LAUNCHER` is a separate variable |
+| `cpp-httplib doesn't support Windows 8 or lower` | MinGW defaults `_WIN32_WINNT` below `0x0A00`; the OS is fine, the macro is not |
+| generation returns an empty string | `--log-disable` suppresses the generated text too, but only when stdout is a pipe — correct by hand, empty from a script |
+
+The first two are solved with a two-line shell wrapper that re-exports a
+writable temp directory and `exec "$@"`, passed as both the compiler and the
+linker launcher.
+
 
 ## Parameter budget
 
@@ -740,6 +797,7 @@ tools/
   generate.py         run the model from the command line
   measure_quantization.py  perplexity and footprint per precision level
   bench_kernels.py    rust kernels against OpenBLAS, alternating A/B
+  compare_llamacpp.py llama.cpp agreement check, run before any timing
 rust/
   src/lib.rs          fp32 and int8 matvecs, AVX2, thread pool, C ABI
   src/bin/bench.rs    the same kernels against this crate's scalar loop
@@ -749,6 +807,7 @@ bench/
   results.jsonl       every number ever recorded
   quantization.jsonl  perplexity and footprint per precision level
   kernels.jsonl       kernel timings, rust against numpy
+  llamacpp.jsonl      per-prompt agreement with llama.cpp
 tests/
   corpus.py           the seeded 10,000-string differential corpus
   tiny.py             a 4,000-parameter model built on the fly for tests
