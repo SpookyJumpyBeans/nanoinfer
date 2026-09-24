@@ -23,7 +23,7 @@ The engine's entire runtime dependency list is `numpy`.
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
 | 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done**, WebGPU not started |
-| 8 | Benchmark against llama.cpp on identical hardware | **reference verified**, timings next |
+| 8 | Benchmark against llama.cpp on identical hardware | **done** |
 
 Each phase is verified against a reference implementation before the next one
 starts. Correctness first; a fast wrong answer teaches nothing.
@@ -423,6 +423,61 @@ diverged until `repetition_penalty` was forced to 1.0. Same trap, different
 path, and the reason every sampler that could move an argmax is now pinned
 explicitly rather than inherited.
 
+### Phase 8 results — the numbers
+
+Decode, milliseconds per token, each engine at its own best thread count, three
+separate measurements:
+
+| | threads | sweep | run 1 | run 2 |
+|---|---:|---:|---:|---:|
+| nanoinfer f32 | 6 | **121.44** | **161.70** | **152.28** |
+| llama.cpp f32 | 3 | 127.30 | 176.49 | 208.06 |
+| llama.cpp Q8_0 | 1 | 47.23 | 84.94 | 86.38 |
+
+Absolute numbers drift with how busy the laptop is — they always have here —
+but the direction holds every time:
+
+**At f32 the two engines are a tie, with this one marginally ahead** (1.05–1.37×).
+That is not a claim to have out-engineered llama.cpp. It is phase 4's thesis
+arriving on schedule: decode reads all 1.98 GB of weights to produce one 896-value
+vector, so it is bound by memory bandwidth and not by arithmetic. When the wall is
+bandwidth, a better kernel cannot help, and OpenBLAS's `sgemv` is already excellent.
+f32 is also not llama.cpp's optimized path — essentially nobody runs it that way.
+
+**llama.cpp's real advantage is quantization, 1.8–2.6×.** Q8_0 is 500.79 MiB
+against 1884.59 MiB, so it moves a quarter of the bytes, and llama.cpp has
+integer kernels that consume them directly. That is exactly the win phase 6
+identified and could not collect, and exactly what phase 7's kernels were for —
+they are written, tested and 1.22× faster than OpenBLAS, and they are still not
+wired into the forward pass. The gap between 152 and 86 ms/token is what
+finishing that would be worth.
+
+**llama.cpp wins prefill outright, 2–3×** (22–45 ms/token against 69–77). Prefill
+is a compute-bound matmul over the whole prompt, which is the regime where better
+kernels do pay.
+
+### Handing your opponent a bad flag is not a benchmark
+
+The first run of this comparison said nanoinfer decoded **2× faster than
+llama.cpp**. That is an extraordinary claim, and the ordinary explanation was
+the true one: llama.cpp had been given `-t 20`.
+
+This CPU is Alder Lake — 6 fast P-cores and 8 slow E-cores behind 20 logical
+threads. Splitting a memory-bound matvec evenly across them leaves the fast
+cores waiting on the slow ones:
+
+| threads | Q8_0 | f32 | nanoinfer f32 |
+|---:|---:|---:|---:|
+| 1 | **47.23** | 270.35 | 209.39 |
+| 3 | 102.16 | **127.30** | 170.99 |
+| 6 | 103.46 | 211.38 | **121.44** |
+| 20 | 264.53 | 278.12 | 181.09 |
+
+A 5.6× swing on Q8_0 from one flag. So both sides are swept, because sweeping
+only the opponent would be worse than not sweeping at all — and that turned out
+to matter in both directions: this engine's own default of all 20 BLAS threads
+was costing it 50%.
+
 ### Building llama.cpp on Windows, for whoever needs it next
 
 Four fixes, none of them in llama.cpp's code, all of them specific to a MinGW
@@ -798,6 +853,7 @@ tools/
   measure_quantization.py  perplexity and footprint per precision level
   bench_kernels.py    rust kernels against OpenBLAS, alternating A/B
   compare_llamacpp.py llama.cpp agreement check, run before any timing
+  bench_llamacpp.py   the head-to-head, each engine at its best threads
 rust/
   src/lib.rs          fp32 and int8 matvecs, AVX2, thread pool, C ABI
   src/bin/bench.rs    the same kernels against this crate's scalar loop
@@ -808,6 +864,7 @@ bench/
   quantization.jsonl  perplexity and footprint per precision level
   kernels.jsonl       kernel timings, rust against numpy
   llamacpp.jsonl      per-prompt agreement with llama.cpp
+  llamacpp_timing.jsonl  decode and prefill against llama.cpp
 tests/
   corpus.py           the seeded 10,000-string differential corpus
   tiny.py             a 4,000-parameter model built on the fly for tests
@@ -835,6 +892,10 @@ python -m tools.measure_quantization int4 --group-size 32
 # rust kernels; entirely optional, the engine runs without them
 cd rust && cargo test --release && cargo run --release --bin bench
 cd .. && python -m tools.bench_kernels
+
+# llama.cpp, verified first and only then timed
+python -m tools.compare_llamacpp --llama-cpp ../llama.cpp
+OPENBLAS_NUM_THREADS=6 python -m tools.bench_llamacpp --llama-cpp ../llama.cpp
 
 python -m pytest                                    # 719 tests
 ```
