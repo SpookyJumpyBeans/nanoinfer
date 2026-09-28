@@ -897,7 +897,7 @@ cd .. && python -m tools.bench_kernels
 python -m tools.compare_llamacpp --llama-cpp ../llama.cpp
 OPENBLAS_NUM_THREADS=6 python -m tools.bench_llamacpp --llama-cpp ../llama.cpp
 
-python -m pytest                                    # 719 tests
+python -m pytest                                    # 728 tests
 ```
 
 Run the model:
@@ -910,6 +910,22 @@ python -m tools.generate --chat "Explain RoPE in one sentence."
 python -m tools.generate --prompt "Once upon a time" --model-defaults --seed 1
 python -m tools.generate --prompt "Once upon a time" --temperature 0.9 --top-p 0.95 --seed 42
 ```
+
+Look inside it while it runs:
+
+```bash
+python -m viz          # then open http://127.0.0.1:8000
+```
+
+A local page with three views, served by the standard library alone: the
+candidates the model weighed at each step (and how temperature, top-k and top-p
+would have re-ranked them), attention for any layer and head, and the same
+prompt raced with and without the KV cache. It lives in `viz/` and the engine
+never imports it. Attention is captured by wrapping the softmax that
+`nanoinfer.attention` calls, not by editing it, and `tests/test_viz.py` requires
+the traced run to pick the same tokens as `greedy_stream` and its row-by-row
+attention to equal a single uncached pass, so the page cannot quietly show a
+different model from the one the tests verify.
 
 `tools.inspect_weights` builds the complete expected tensor manifest from
 `config.json` alone and diffs it against the file. It exits non-zero on any

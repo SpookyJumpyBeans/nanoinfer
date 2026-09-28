@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanoinfer, inside</title>
+<style>
+:root{
+  --bg:#F4F5F7; --panel:#FFFFFF; --panel-2:#ECEEF2; --ink:#161A21; --muted:#5E6675; --line:#D8DCE3;
+  --heat:#4B3FD1; --heat-rgb:75,63,209; --pick:#C2410C; --pick-soft:#FCE7DA; --ok:#1F7A4D; --ok-soft:#DDF1E6;
+  --prompt:#8A91A0;
+  --mono:ui-monospace,"Cascadia Mono","SFMono-Regular",Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0E1116; --panel:#161A21; --panel-2:#1D222B; --ink:#E7EAF0; --muted:#98A0AE; --line:#2A303B;
+    --heat:#9C93FF; --heat-rgb:156,147,255; --pick:#FB923C; --pick-soft:#3A2416; --ok:#5CC98E; --ok-soft:#14301F;
+    --prompt:#7A8190; color-scheme:dark;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans)}
+.wrap{max-width:1180px;margin:0 auto;padding:24px 20px 60px;display:flex;flex-direction:column;gap:18px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 16px}
+header h1{margin:0;font:600 22px/1.2 var(--mono);letter-spacing:-.02em}
+header h1 span{color:var(--heat)}
+.meta{font:12px var(--mono);color:var(--muted)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+.controls{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:start}
+textarea,input,select{font:14px var(--sans);color:var(--ink);background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+textarea{width:100%;min-height:62px;resize:vertical;font-family:var(--mono);font-size:13px}
+.knobs{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;margin-top:10px}
+.knob{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
+.knob input[type=number]{width:74px;padding:5px 7px}
+.knob input[type=range]{width:120px}
+.knob output{font:12px var(--mono);color:var(--ink);min-width:34px}
+button{font:600 13px var(--sans);border-radius:6px;padding:9px 16px;cursor:pointer;border:1px solid var(--line);background:var(--panel-2);color:var(--ink)}
+button.go{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+button:disabled{opacity:.5;cursor:progress}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,.tok:focus-visible,[role=tab]:focus-visible{outline:2px solid var(--heat);outline-offset:2px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line)}
+[role=tab]{background:none;border:none;border-bottom:2px solid transparent;border-radius:0;padding:10px 14px;color:var(--muted);font-weight:600}
+[role=tab][aria-selected=true]{color:var(--ink);border-bottom-color:var(--ink)}
+.status{font:12px var(--mono);color:var(--muted);min-height:18px}
+.status.err{color:var(--pick)}
+.hint{color:var(--muted);font-size:13px;max-width:78ch;margin:0}
+/* tokens */
+.tokens{font:13px/2.1 var(--mono);display:flex;flex-wrap:wrap;gap:2px 1px}
+.tok{white-space:pre;padding:1px 3px;border-radius:3px;border:1px solid transparent;cursor:pointer;background:none;color:var(--ink);font:inherit;line-height:1.5}
+.tok.p{color:var(--prompt)}
+.tok.g{font-weight:600}
+.tok.sel{border-color:var(--pick);background:var(--pick-soft)}
+.tok .nl{opacity:.5}
+/* next-token */
+.split{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:18px}
+.bars{display:flex;flex-direction:column;gap:6px}
+.bar{display:grid;grid-template-columns:120px 1fr 64px;gap:10px;align-items:center;font:12px var(--mono)}
+.bar .lbl{white-space:pre;overflow:hidden;text-overflow:ellipsis;text-align:right}
+.bar .track{position:relative;height:16px;background:var(--panel-2);border-radius:3px;overflow:hidden}
+.bar .m{position:absolute;inset:0 auto 0 0;background:rgba(var(--heat-rgb),.28)}
+.bar .s{position:absolute;inset:4px auto 4px 0;background:var(--heat);border-radius:2px}
+.bar.chosen .lbl{color:var(--pick);font-weight:700}
+.bar.chosen .s{background:var(--pick)}
+.bar .pct{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.sw{display:inline-block;width:12px;height:10px;border-radius:2px;vertical-align:-1px;margin-right:5px}
+.spark{display:flex;align-items:flex-end;gap:2px;height:48px;margin-top:6px}
+.spark i{flex:1;min-width:3px;max-width:14px;background:rgba(var(--heat-rgb),.55);border-radius:2px 2px 0 0}
+.spark i.sel{background:var(--pick)}
+h3{margin:0 0 8px;font:600 13px var(--sans);text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.whatif{margin-top:14px;padding-top:12px;border-top:1px dashed var(--line)}
+/* attention */
+.attn-controls{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+.heat-wrap{overflow:auto;max-width:100%}
+canvas{display:block;image-rendering:pixelated}
+.tip{font:12px var(--mono);color:var(--muted);min-height:18px}
+/* race */
+.lanes{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.lane h3{display:flex;justify-content:space-between}
+.lane .tokens{min-height:60px}
+.lane .ms{display:flex;align-items:flex-end;gap:2px;height:70px;margin-top:8px;border-bottom:1px solid var(--line)}
+.lane .ms i{flex:1;max-width:22px;background:var(--heat);border-radius:2px 2px 0 0}
+.verdict{padding:10px 14px;border-radius:8px;font-weight:600}
+.verdict.ok{background:var(--ok-soft);color:var(--ok)}
+.verdict.bad{background:var(--pick-soft);color:var(--pick)}
+[hidden]{display:none!important}
+@media (max-width:820px){.controls,.split,.lanes{grid-template-columns:1fr}.bar{grid-template-columns:90px 1fr 56px}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>nanoinfer<span>/inside</span></h1>
+    <span class="meta" id="meta">connecting…</span>
+  </header>
+
+  <div class="card controls">
+    <div>
+      <label for="prompt" class="hint">Prompt</label>
+      <textarea id="prompt">The capital of France is</textarea>
+      <div class="knobs">
+        <label class="knob"><input type="checkbox" id="chat"> chat format</label>
+        <label class="knob" for="max">tokens <input type="number" id="max" min="1" max="48" value="16"></label>
+        <label class="knob" for="temp">temperature <input type="range" id="temp" min="0" max="2" step="0.05" value="0"><output id="temp-o">0</output></label>
+        <label class="knob" for="topk">top-k <input type="number" id="topk" min="0" max="200" value="0"></label>
+        <label class="knob" for="topp">top-p <input type="range" id="topp" min="0.05" max="1" step="0.05" value="1"><output id="topp-o">1</output></label>
+        <label class="knob" for="seed">seed <input type="number" id="seed" value="0"></label>
+      </div>
+    </div>
+    <button class="go" id="run">Generate</button>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" id="t-next" aria-selected="true" aria-controls="v-next">Next token</button>
+    <button role="tab" id="t-attn" aria-selected="false" aria-controls="v-attn">Attention</button>
+    <button role="tab" id="t-race" aria-selected="false" aria-controls="v-race">Cache on vs off</button>
+  </div>
+  <div class="status" id="status"></div>
+
+  <!-- NEXT TOKEN -->
+  <section id="v-next" role="tabpanel" aria-labelledby="t-next">
+    <div class="split">
+      <div class="card">
+        <h3>Text, token by token</h3>
+        <p class="hint">Grey is the prompt. Click any generated token to see what else the model considered at that step.</p>
+        <div class="tokens" id="gen-tokens" style="margin-top:10px"></div>
+        <h3 style="margin-top:18px">Time per step (ms)</h3>
+        <div class="spark" id="spark" aria-label="Milliseconds per generated token"></div>
+        <div class="tip" id="spark-tip">The first bar is the whole prompt at once; the rest are one token each with the cache.</div>
+      </div>
+      <div class="card">
+        <h3 id="cand-title">Candidates</h3>
+        <div class="legend">
+          <span><span class="sw" style="background:rgba(var(--heat-rgb),.28)"></span>model's probability</span>
+          <span><span class="sw" style="background:var(--heat)"></span>after sampling filters</span>
+          <span><span class="sw" style="background:var(--pick)"></span>chosen</span>
+        </div>
+        <div class="bars" id="bars" style="margin-top:12px"><p class="hint">Generate something to see the model's top candidates.</p></div>
+        <div class="whatif">
+          <h3>What if, at this step</h3>
+          <p class="hint">Re-rank this step's real logits under different settings. The text above does not change; this shows what the sampler would have drawn from.</p>
+          <div class="knobs">
+            <label class="knob" for="w-temp">temperature <input type="range" id="w-temp" min="0" max="2" step="0.05" value="1"><output id="w-temp-o">1</output></label>
+            <label class="knob" for="w-topk">top-k <input type="number" id="w-topk" min="0" max="200" value="0"></label>
+            <label class="knob" for="w-topp">top-p <input type="range" id="w-topp" min="0.05" max="1" step="0.05" value="1"><output id="w-topp-o">1</output></label>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ATTENTION -->
+  <section id="v-attn" role="tabpanel" aria-labelledby="t-attn" hidden>
+    <div class="card" style="display:flex;flex-direction:column;gap:14px">
+      <p class="hint">Each row is a token <em>looking back</em>; each column is an earlier token it can see. Brighter means more attention. The upper triangle is empty because a token can never see the future.</p>
+      <div class="attn-controls">
+        <label class="knob" for="layer">layer <input type="range" id="layer" min="0" max="23" value="12"><output id="layer-o">12</output></label>
+        <label class="knob" for="head">head <select id="head"><option value="avg">average of all</option></select></label>
+        <label class="knob"><input type="checkbox" id="sink" checked> ignore the first token when shading</label>
+      </div>
+      <div>
+        <h3>Click a token to see what it attended to</h3>
+        <div class="tokens" id="attn-tokens"></div>
+      </div>
+      <div class="heat-wrap"><canvas id="heat" width="10" height="10" aria-label="Attention heatmap"></canvas></div>
+      <div class="tip" id="heat-tip">Hover the heatmap for exact weights.</div>
+      <p class="hint">Why ignore the first token? Many heads park most of their attention on it when they have nothing useful to look at (an "attention sink"). Leaving it in makes everything else look black.</p>
+    </div>
+  </section>
+
+  <!-- RACE -->
+  <section id="v-race" role="tabpanel" aria-labelledby="t-race" hidden>
+    <div class="card" style="display:flex;flex-direction:column;gap:14px">
+      <p class="hint">Runs your prompt twice through the engine's own decode loop: once with the KV cache, once recomputing everything each step. Greedy, plain text (no chat format). The uncached run is slow on purpose; that is the point.</p>
+      <div class="knobs" style="margin-top:0">
+        <label class="knob" for="race-n">tokens <input type="number" id="race-n" min="1" max="12" value="8"></label>
+        <button id="race-go">Run both</button>
+      </div>
+      <div class="lanes">
+        <div class="lane"><h3><span>Cache on</span><span id="c-total"></span></h3><div class="tokens" id="c-tok"></div><div class="ms" id="c-ms"></div></div>
+        <div class="lane"><h3><span>Cache off</span><span id="u-total"></span></h3><div class="tokens" id="u-tok"></div><div class="ms" id="u-ms"></div></div>
+      </div>
+      <div class="tip">Bars are milliseconds per token, on the same scale in both lanes.</div>
+      <div id="verdict" hidden></div>
+    </div>
+  </section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const state = { steps: [], promptTokens: [], sel: null, running: false, attn: null, attnRow: null };
+
+function show(text){ // make whitespace visible without changing the token
+  if (text === "\n") return "↵";
+  return text.replace(/\n/g, "↵");
+}
+function tokEl(t, cls){
+  const b = document.createElement("button");
+  b.className = "tok " + cls; b.type = "button";
+  b.textContent = show(t.text) || "∅";
+  b.title = `id ${t.id}`;
+  return b;
+}
+function setStatus(msg, err){ $("status").textContent = msg || ""; $("status").classList.toggle("err", !!err); }
+function busy(on){ state.running = on; $("run").disabled = on; $("race-go").disabled = on; }
+function pct(p){ return p >= 0.1 ? (p*100).toFixed(1)+"%" : p >= 0.001 ? (p*100).toFixed(2)+"%" : "<0.1%"; }
+
+// knobs mirror their outputs
+for (const [i,o] of [["temp","temp-o"],["topp","topp-o"],["w-temp","w-temp-o"],["w-topp","w-topp-o"],["layer","layer-o"]])
+  $(i).addEventListener("input", () => $(o).textContent = $(i).value);
+
+// tabs
+const tabs = ["next","attn","race"];
+function select(name){
+  for (const t of tabs){
+    $("t-"+t).setAttribute("aria-selected", String(t===name));
+    $("v-"+t).hidden = t !== name;
+  }
+  if (name === "attn" && state.steps.length) loadAttention();
+}
+for (const t of tabs) $("t-"+t).addEventListener("click", () => select(t));
+
+fetch("/api/info").then(r => r.json()).then(i => {
+  $("meta").textContent = `${i.model} · ${i.layers} layers · ${i.heads} query heads / ${i.kv_heads} KV heads · hidden ${i.hidden}`;
+  $("layer").max = i.layers - 1;
+  for (let h = 0; h < i.heads; h++){ const o = document.createElement("option"); o.value = h; o.textContent = "head " + h; $("head").append(o); }
+}).catch(() => { $("meta").textContent = "server not reachable"; });
+
+// ---------- generate ----------
+$("run").addEventListener("click", () => {
+  if (state.running) return;
+  const q = new URLSearchParams({
+    prompt: $("prompt").value, chat: $("chat").checked ? "1" : "0", max: $("max").value,
+    temperature: $("temp").value, top_k: $("topk").value, top_p: $("topp").value, seed: $("seed").value,
+  });
+  state.steps = []; state.sel = null; state.attn = null;
+  $("gen-tokens").innerHTML = ""; $("spark").innerHTML = ""; $("bars").innerHTML = "";
+  busy(true); setStatus("Running the prompt through 24 layers…");
+  select("next");
+  const es = new EventSource("/api/generate?" + q);
+  es.addEventListener("prompt", e => {
+    state.promptTokens = JSON.parse(e.data).tokens;
+    for (const t of state.promptTokens){ const el = tokEl(t, "p"); el.tabIndex = -1; $("gen-tokens").append(el); }
+  });
+  es.addEventListener("token", e => {
+    const d = JSON.parse(e.data);
+    state.steps.push(d);
+    const el = tokEl(d, "g");
+    el.dataset.step = d.index;
+    el.addEventListener("click", () => pickStep(d.index));
+    $("gen-tokens").append(el);
+    drawSpark();
+    pickStep(d.index);
+    setStatus(`Generated ${state.steps.length} token${state.steps.length>1?"s":""}…`);
+  });
+  es.addEventListener("done", e => {
+    const d = JSON.parse(e.data); es.close(); busy(false);
+    setStatus(`${d.n_prompt} prompt tokens in ${d.prefill_ms} ms · then ${d.decode_tps ?? "–"} tokens/sec · stopped: ${d.stop === "stop_token" ? "model ended its turn" : "token limit"}`);
+  });
+  es.addEventListener("fail", e => { es.close(); busy(false); setStatus(JSON.parse(e.data).message, true); });
+  es.onerror = () => { if (state.running){ es.close(); busy(false); setStatus("Lost the connection to the server. Is `python -m viz` still running?", true); } };
+});
+
+function drawSpark(){
+  const max = Math.max(...state.steps.map(s => s.ms), 1);
+  $("spark").innerHTML = state.steps.map((s,i) =>
+    `<i style="height:${Math.max(3, s.ms/max*100)}%" class="${i===state.sel?"sel":""}" title="step ${i}: ${s.ms} ms"></i>`).join("");
+}
+
+function pickStep(i){
+  state.sel = i;
+  document.querySelectorAll("#gen-tokens .tok.g").forEach(el => el.classList.toggle("sel", Number(el.dataset.step) === i));
+  drawSpark();
+  const s = state.steps[i];
+  $("cand-title").textContent = `Candidates at step ${i + 1}`;
+  drawBars(s.candidates, s.id);
+  // seed the what-if knobs from the settings actually used
+  $("w-temp").value = $("temp").value === "0" ? "1" : $("temp").value; $("w-temp-o").textContent = $("w-temp").value;
+  $("w-topk").value = $("topk").value; $("w-topp").value = $("topp").value; $("w-topp-o").textContent = $("w-topp").value;
+}
+
+function drawBars(cands, chosen){
+  const top = Math.max(...cands.map(c => Math.max(c.p_model, c.p_sampled)), 1e-9);
+  $("bars").innerHTML = "";
+  for (const c of cands){
+    const row = document.createElement("div");
+    row.className = "bar" + (c.id === chosen ? " chosen" : "");
+    const lbl = document.createElement("span"); lbl.className = "lbl"; lbl.textContent = show(c.text) || "∅"; lbl.title = "id " + c.id;
+    const track = document.createElement("span"); track.className = "track";
+    track.innerHTML = `<span class="m" style="width:${c.p_model/top*100}%"></span><span class="s" style="width:${c.p_sampled/top*100}%"></span>`;
+    const p = document.createElement("span"); p.className = "pct"; p.textContent = pct(c.p_sampled);
+    row.append(lbl, track, p); $("bars").append(row);
+  }
+}
+
+let whatIfTimer;
+function whatIf(){
+  if (state.sel === null) return;
+  clearTimeout(whatIfTimer);
+  whatIfTimer = setTimeout(async () => {
+    const q = new URLSearchParams({ step: state.sel, temperature: $("w-temp").value, top_k: $("w-topk").value, top_p: $("w-topp").value });
+    try {
+      const r = await fetch("/api/resample?" + q); const d = await r.json();
+      if (d.candidates) drawBars(d.candidates, d.chosen);
+    } catch { setStatus("Couldn't re-rank this step. Is the server still running?", true); }
+  }, 120);
+}
+for (const id of ["w-temp","w-topk","w-topp"]) $(id).addEventListener("input", whatIf);
+
+// ---------- attention ----------
+async function loadAttention(){
+  const q = new URLSearchParams({ layer: $("layer").value, head: $("head").value });
+  try {
+    const d = await (await fetch("/api/attention?" + q)).json();
+    if (d.error){ $("heat-tip").textContent = "Generate something first."; return; }
+    state.attn = d;
+    if (state.attnRow === null || state.attnRow >= d.tokens.length) state.attnRow = d.tokens.length - 1;
+    drawAttnTokens(); drawHeat();
+  } catch { setStatus("Couldn't load attention. Is the server still running?", true); }
+}
+for (const id of ["layer","head"]) $(id).addEventListener("change", loadAttention);
+$("layer").addEventListener("input", () => { clearTimeout(state.lt); state.lt = setTimeout(loadAttention, 150); });
+$("sink").addEventListener("change", () => { drawAttnTokens(); drawHeat(); });
+
+function scaleFor(row){ // normalise a row for shading, optionally skipping the sink
+  const skip = $("sink").checked ? 1 : 0;
+  let m = 0; for (let j = skip; j < row.length; j++) m = Math.max(m, row[j]);
+  return m || 1;
+}
+function drawAttnTokens(){
+  const d = state.attn, row = d.matrix[state.attnRow], m = scaleFor(row);
+  const box = $("attn-tokens"); box.innerHTML = "";
+  d.tokens.forEach((t, j) => {
+    const el = tokEl(t, j < d.n_prompt ? "p" : "g");
+    if (j === state.attnRow) el.classList.add("sel");
+    else if (j === 0 && $("sink").checked){
+      el.style.outline = "1px dashed var(--muted)";
+    }
+    else if (j < state.attnRow){
+      const a = Math.min(1, row[j] / m);
+      el.style.background = `rgba(var(--heat-rgb),${(a*0.85).toFixed(3)})`;
+      if (a > 0.55) el.style.color = "#fff";
+    }
+    el.title = `id ${t.id} · attention ${(row[j]*100).toFixed(2)}%`;
+    el.addEventListener("click", () => { state.attnRow = j; drawAttnTokens(); drawHeat(); });
+    box.append(el);
+  });
+}
+function drawHeat(){
+  const d = state.attn, n = d.tokens.length, c = $("heat");
+  const cell = Math.max(3, Math.min(14, Math.floor(Math.min(c.parentElement.clientWidth, 720) / n)));
+  c.width = n * cell; c.height = n * cell;
+  const ctx = c.getContext("2d");
+  const cs = getComputedStyle(document.documentElement);
+  const rgb = cs.getPropertyValue("--heat-rgb").trim();
+  ctx.fillStyle = cs.getPropertyValue("--panel-2"); ctx.fillRect(0, 0, c.width, c.height);
+  for (let i = 0; i < n; i++){
+    const m = scaleFor(d.matrix[i]);
+    for (let j = 0; j <= i; j++){
+      const a = Math.min(1, d.matrix[i][j] / m);
+      ctx.fillStyle = `rgba(${rgb},${Math.sqrt(a).toFixed(3)})`;
+      ctx.fillRect(j*cell, i*cell, cell, cell);
+    }
+  }
+  ctx.strokeStyle = cs.getPropertyValue("--pick"); ctx.lineWidth = 2;
+  ctx.strokeRect(1, state.attnRow*cell + 1, c.width - 2, cell - 2);
+  // prompt/generated boundary
+  ctx.strokeStyle = cs.getPropertyValue("--muted"); ctx.setLineDash([4,3]); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, d.n_prompt*cell); ctx.lineTo(c.width, d.n_prompt*cell); ctx.stroke(); ctx.setLineDash([]);
+  c.onmousemove = e => {
+    const r = c.getBoundingClientRect(), i = Math.floor((e.clientY - r.top)/cell), j = Math.floor((e.clientX - r.left)/cell);
+    if (i < 0 || j < 0 || i >= n || j >= n) return;
+    $("heat-tip").textContent = j > i ? `"${show(d.tokens[i].text)}" cannot see "${show(d.tokens[j].text)}" (future)` :
+      `"${show(d.tokens[i].text)}" → "${show(d.tokens[j].text)}": ${(d.matrix[i][j]*100).toFixed(2)}% · layer ${d.layer}, head ${d.head}`;
+  };
+  c.onclick = e => { const r = c.getBoundingClientRect(); state.attnRow = Math.min(n-1, Math.floor((e.clientY - r.top)/cell)); drawAttnTokens(); drawHeat(); };
+}
+
+// ---------- race ----------
+$("race-go").addEventListener("click", () => {
+  if (state.running) return;
+  for (const id of ["c-tok","u-tok","c-ms","u-ms"]) $(id).innerHTML = "";
+  $("c-total").textContent = ""; $("u-total").textContent = ""; $("verdict").hidden = true;
+  const lanes = { cached: { tok:"c-tok", ms:"c-ms", total:"c-total", times:[] }, uncached: { tok:"u-tok", ms:"u-ms", total:"u-total", times:[] } };
+  busy(true); setStatus("Cache on…");
+  let ticker, started;
+  const es = new EventSource("/api/race?" + new URLSearchParams({ prompt: $("prompt").value, max: $("race-n").value }));
+  const redraw = () => {
+    const max = Math.max(1, ...lanes.cached.times, ...lanes.uncached.times);
+    for (const L of Object.values(lanes)) $(L.ms).innerHTML = L.times.map(t => `<i style="height:${Math.max(2, t/max*100)}%" title="${t} ms"></i>`).join("");
+  };
+  es.addEventListener("lane", e => {
+    const lane = JSON.parse(e.data).lane; started = performance.now();
+    clearInterval(ticker);
+    ticker = setInterval(() => setStatus(`${lane === "cached" ? "Cache on" : "Cache off, recomputing every earlier token each step"}… ${((performance.now()-started)/1000).toFixed(1)} s`), 200);
+  });
+  es.addEventListener("token", e => {
+    const d = JSON.parse(e.data), L = lanes[d.lane];
+    L.times.push(d.ms); $(L.tok).append(tokEl(d, "g")); redraw();
+  });
+  es.addEventListener("lane_done", e => { const d = JSON.parse(e.data); $(lanes[d.lane].total).textContent = (d.total_ms/1000).toFixed(2) + " s"; });
+  es.addEventListener("done", e => {
+    const d = JSON.parse(e.data); es.close(); clearInterval(ticker); busy(false); setStatus("");
+    const v = $("verdict"); v.hidden = false;
+    v.className = "verdict " + (d.identical ? "ok" : "bad");
+    v.textContent = d.identical
+      ? `Identical output, token for token. Without the cache it took ${d.speedup_total}× as long.`
+      : `Outputs differ. The cache changed the answer, which would be a bug.`;
+  });
+  es.addEventListener("fail", e => { es.close(); clearInterval(ticker); busy(false); setStatus(JSON.parse(e.data).message, true); });
+  es.onerror = () => { if (state.running){ es.close(); clearInterval(ticker); busy(false); setStatus("Lost the connection to the server.", true); } };
+});
+</script>
+</body>
+</html>
