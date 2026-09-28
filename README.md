@@ -12,6 +12,12 @@ imports.
 
 The engine's entire runtime dependency list is `numpy`.
 
+A browser view of the engine's internals, `python -m viz`, shows the candidates
+behind every token, attention for any layer and head, and the cache raced
+against the uncached path. [More below.](#running-it)
+
+![The visualizer's next-token view](docs/viz-next-token.png)
+
 ## Status
 
 | Phase | What | State |
@@ -926,6 +932,25 @@ never imports it. Attention is captured by wrapping the softmax that
 the traced run to pick the same tokens as `greedy_stream` and its row-by-row
 attention to equal a single uncached pass, so the page cannot quietly show a
 different model from the one the tests verify.
+
+**What the model weighed at each step.** Greedy decoding picks " Paris", but
+the model only gave it 30%; its runner-up was a fill-in-the-blank underscore,
+because a bare "The capital of France is" reads like a quiz.
+
+![Next-token view: generated text and the top candidates for the first step](docs/viz-next-token.png)
+
+**Where each token looked.** Layer 12, averaged over heads: the final "the"
+attends mostly to "Europe", "largest" and "city". The first token is left
+unshaded because it is an attention sink and would otherwise wash out the rest.
+
+![Attention view: token strip and lower-triangular heatmap for layer 12](docs/viz-attention.png)
+
+**The cache changes the speed, never the answer.** Same prompt, same six
+tokens, through the engine's own decode loop with and without the cache. This
+is a short interactive run, not the controlled measurement; see
+[Phase 4](#phase-4--kv-cache) for that.
+
+![Cache race: identical output with the cache on and off](docs/viz-cache-race.png)
 
 `tools.inspect_weights` builds the complete expected tensor manifest from
 `config.json` alone and diffs it against the file. It exits non-zero on any
