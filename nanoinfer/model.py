@@ -32,6 +32,7 @@ import numpy as np
 from nanoinfer.attention import self_attention
 from nanoinfer.config import ModelConfig
 from nanoinfer.kvcache import KVCache
+from nanoinfer.linear import gather_rows, linear
 from nanoinfer.ops import rms_norm, silu
 from nanoinfer.rope import RotaryEmbedding
 from nanoinfer.weights import LayerWeights, ModelWeights
@@ -48,9 +49,9 @@ def feed_forward(hidden: np.ndarray, layer: LayerWeights) -> np.ndarray:
 
     This is where two thirds of the model's parameters live.
     """
-    gate = hidden @ layer.gate_proj_weight.T
-    up = hidden @ layer.up_proj_weight.T
-    return (silu(gate) * up) @ layer.down_proj_weight.T
+    gate = linear(hidden, layer.gate_proj_weight)
+    up = linear(hidden, layer.up_proj_weight)
+    return linear(silu(gate) * up, layer.down_proj_weight)
 
 
 def transformer_block(
@@ -119,7 +120,7 @@ class Qwen2:
                 f"(0..{self.config.vocab_size - 1})"
             )
 
-        return self.weights.embed_tokens[token_ids]
+        return gather_rows(self.weights.embed_tokens, token_ids)
 
     def new_cache(self, capacity: int) -> KVCache:
         """Allocate a cache sized for this model and a given sequence length."""
@@ -185,7 +186,7 @@ class Qwen2:
             hidden = hidden[-1:]
 
         # Tied embeddings: this is embed_tokens again, used transposed.
-        return hidden @ self.weights.lm_head.T
+        return linear(hidden, self.weights.lm_head)
 
     def next_token_logits(
         self, token_ids: np.ndarray, cache: KVCache | None = None

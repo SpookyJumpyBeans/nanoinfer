@@ -29,6 +29,7 @@ import numpy as np
 
 from nanoinfer.config import ModelConfig
 from nanoinfer.kvcache import KVCache
+from nanoinfer.linear import linear
 from nanoinfer.ops import causal_mask, repeat_kv, softmax
 from nanoinfer.rope import RotaryEmbedding
 from nanoinfer.weights import LayerWeights
@@ -92,9 +93,9 @@ def self_attention(
 
     # Projections. Qwen2 puts biases on Q, K and V but not on the output
     # projection -- unlike most Llama-style models, which have none at all.
-    q = hidden @ layer.q_proj_weight.T + layer.q_proj_bias
-    k = hidden @ layer.k_proj_weight.T + layer.k_proj_bias
-    v = hidden @ layer.v_proj_weight.T + layer.v_proj_bias
+    q = linear(hidden, layer.q_proj_weight) + layer.q_proj_bias
+    k = linear(hidden, layer.k_proj_weight) + layer.k_proj_bias
+    v = linear(hidden, layer.v_proj_weight) + layer.v_proj_bias
 
     q = split_heads(q, n_heads, head_dim)
     k = split_heads(k, n_kv, head_dim)
@@ -136,4 +137,4 @@ def self_attention(
     weights = softmax(scores, axis=-1)
     context = weights @ v
 
-    return merge_heads(context) @ layer.o_proj_weight.T
+    return linear(merge_heads(context), layer.o_proj_weight)
