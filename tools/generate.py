@@ -2,6 +2,11 @@
 
     python -m tools.generate --prompt "The capital of France is" --max-tokens 20
     python -m tools.generate --chat "Explain RoPE in one sentence."
+    python -m tools.generate --prompt "The capital of France is" --int8
+
+``--int8`` holds every linear projection as int8 and runs it through the Rust
+kernel; ``--int8 --int8-embeddings`` also quantizes the embedding matrix, which
+doubles as the LM head and is the single largest read in a decode step.
 
 ``--chat`` wraps the prompt in the ChatML layout the Instruct model was tuned
 on. Without it the model is a plain text continuer, which is a genuinely
@@ -20,7 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from nanoinfer.chat import ChatTemplate  # noqa: E402
 from nanoinfer.sampling import Sampler, SamplingConfig  # noqa: E402
 from nanoinfer.generate import greedy  # noqa: E402
+from nanoinfer.linear import backend  # noqa: E402
 from nanoinfer.model import Qwen2  # noqa: E402
+from nanoinfer.quantization import quantize_model  # noqa: E402
 from nanoinfer.tokenizer import Tokenizer  # noqa: E402
 
 
@@ -42,12 +49,25 @@ def main(argv: list[str] | None = None) -> int:
                         help="use the sampling settings the model ships")
     parser.add_argument("--no-cache", action="store_true",
                         help="disable the KV cache; much slower, kept for comparison")
+    parser.add_argument("--int8", action="store_true",
+                        help="hold linear weights as int8 and run them in the Rust kernel")
+    parser.add_argument("--int8-embeddings", action="store_true",
+                        help="with --int8, quantize the embedding matrix / LM head too")
     args = parser.parse_args(argv)
+    if args.int8_embeddings and not args.int8:
+        parser.error("--int8-embeddings needs --int8")
 
     print(f"loading {args.model}", file=sys.stderr)
     start = time.perf_counter()
     tokenizer = Tokenizer.from_model_dir(args.model)
     model = Qwen2.from_model_dir(args.model)
+    if args.int8:
+        weights, report = quantize_model(
+            model.weights, bits=8,
+            quantize_embeddings=args.int8_embeddings, dequantize=False,
+        )
+        model = Qwen2(weights)
+        print(f"{report}  |  {backend()}", file=sys.stderr)
     print(f"loaded in {time.perf_counter() - start:.2f}s", file=sys.stderr)
 
     if args.chat:

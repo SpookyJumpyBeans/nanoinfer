@@ -28,7 +28,7 @@ against the uncached path. [More below.](#running-it)
 | 4 | KV cache; identical output, measured speedup | **done** |
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
-| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done**, WebGPU not started |
+| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done and wired in**, WebGPU not started |
 | 8 | Benchmark against llama.cpp on identical hardware | **done** |
 
 Each phase is verified against a reference implementation before the next one
@@ -384,6 +384,10 @@ and the LM head are untouched. Scaled to a token that is 45.7 → 37.5 ms of
 projection time, which is a ceiling on what these kernels can move rather than
 a token rate.
 
+The int8 projections are now wired into the forward pass — see
+[phase 7, finished](#phase-7-finished--int8-in-the-forward-pass) after phase 8,
+which is what made it worth doing.
+
 **WebGPU is not started.** Phase 7 was scoped as CPU SIMD first, then compute
 shaders; the CPU half is done and measured, and the GPU half is not begun.
 
@@ -456,7 +460,8 @@ integer kernels that consume them directly. That is exactly the win phase 6
 identified and could not collect, and exactly what phase 7's kernels were for —
 they are written, tested and 1.22× faster than OpenBLAS, and they are still not
 wired into the forward pass. The gap between 152 and 86 ms/token is what
-finishing that would be worth.
+finishing that would be worth. (They are now — see
+[phase 7, finished](#phase-7-finished--int8-in-the-forward-pass).)
 
 **llama.cpp wins prefill outright, 2–3×** (22–45 ms/token against 69–77). Prefill
 is a compute-bound matmul over the whole prompt, which is the regime where better
@@ -500,6 +505,108 @@ The first two are solved with a two-line shell wrapper that re-exports a
 writable temp directory and `exec "$@"`, passed as both the compiler and the
 linker launcher.
 
+
+### Phase 7, finished — int8 in the forward pass
+
+Phase 8 ended on a number: the gap between 152 and 86 ms/token is what wiring
+phase 7's kernels into the forward pass would be worth. They now are.
+
+`quantize_model(..., dequantize=False)` keeps INT8 weights as int8 instead of
+rounding them and handing back float32, and every projection in the forward
+pass — including the LM head and the embedding lookup — goes through one
+function, `linear()`, that sends an fp32 array to BLAS exactly as before and an
+int8 tensor to Rust. There is still one forward pass; the weights decide the
+route.
+
+**It computes the function phase 6 measured.** The perplexity numbers were
+taken on simulated INT8 — the same integers, dequantized. If the stored-int8
+model computed something else, those numbers would describe a model nobody
+runs. On the tiny model the two agree to 1.3e-7 in the logits, while fp32 sits
+3.3e-3 away, so the 1e-5 gate in `tests/test_int8_engine.py` separates "same
+function, different summation order" from "a different model" with room on
+both sides. Generated tokens are compared exactly. On the real weights that
+same check is `test_real_model_int8_generates_what_simulation_does`.
+
+**Prefill is one call per projection, not one per token.** A new batched kernel
+puts the loop over tokens *inside* the loop over weight rows, so each row is
+read from memory once and stays in L1 while every token is dotted against it.
+It shares its per-row dot product with the matvec, so a prompt processed in one
+call and the same prompt token by token give identical bits — asserted
+bitwise, not to a tolerance.
+
+### Wiring it in made it slower, and the kernel was why
+
+The first whole-model measurement had int8 decoding at **0.42x** the speed of
+fp32. Three things were wrong, found in order:
+
+| | int8 + embed, ms/token |
+|---|---:|
+| as written in phase 7 | 61.9 |
+| four accumulators instead of one | 61.0 |
+| + software prefetch, 4 KiB ahead | **48.6** |
+| fp32, for reference | 52.0 |
+
+*`OPENBLAS_NUM_THREADS=4`, on a 4-core cloud Xeon with synthetic weights of the real shapes, not
+on the reference laptop — see below.*
+
+**The micro-benchmark was cache-hot.** `bench_kernels` times one matrix over and
+over, and a 4864×896 int8 matrix is 4 MB — it lives in L3 after the first call.
+The whole model is 0.5 GB and streams from DRAM every token. Timed that way, cold
+across 48 distinct matrices, the kernel moved int8 at ~13 GB/s while OpenBLAS
+moved fp32 at ~50 GB/s: a quarter of the bytes, at a quarter of the rate, for no
+gain at all.
+
+**One accumulator was a serial chain.** Every FMA waited on the one before it.
+Four independent accumulators doubled the cache-hot speed (1.65 → 0.81 ms per
+layer, single-threaded) and did nothing for decode — which is how it became
+clear the limit had moved to memory.
+
+**Hardware prefetch was not keeping up.** One sequential stream per thread does
+not have enough loads in flight to cover DRAM latency. An explicit prefetch,
+swept from 512 bytes to 16 KiB, plateaued at 4 KiB ahead: single-threaded cold
+streaming went 0.74 → 0.30 ms per gate projection, and the pool 0.33 → 0.21.
+OpenBLAS does the same thing; that is most of why it was winning.
+
+These changes alter the kernel the phase 7 table above measured, so that table
+is now the *old* kernel; rerun `tools.bench_kernels` for the new one.
+
+### Two thread pools on one CPU
+
+| | `OPENBLAS_NUM_THREADS=4` | `=1` |
+|---|---:|---:|
+| fp32 | **52.0** | 157.8 |
+| int8, LM head fp32 | 72.3 | 87.1 |
+| int8 + embed | 48.6 | **45.1** |
+
+`int8` alone — projections in Rust, the 544 MB LM head still in BLAS — is the
+worst of both. Each pool's workers spin for a while after finishing, waiting
+for more work, and on four cores rayon's spinning threads and OpenBLAS's take
+turns starving each other. Quantizing the embeddings removes the only large
+BLAS call left, which is why `--int8-embeddings` is not a footnote here: phase 6
+measured it at +0.02 percentage points of perplexity, and it is the
+configuration where the two pools stop colliding.
+
+### What is not known yet
+
+**These are not reference-machine numbers.** HuggingFace is unreachable from
+the environment this was built in, so every timing above uses random weights
+with Qwen2.5-0.5B's exact shapes (`--synthetic`), on a 4-core Xeon with 260 MB
+of L3, rather than the real weights on the i7-12700H every other table in this
+README comes from. Timing depends on shapes, not values, so the *direction*
+should carry over; the ratios will not, and the 20-thread Alder Lake with its
+P/E-core split is precisely where phase 8 found thread count mattering most. The
+real comparison is:
+
+```
+python -m tools.bench_int8
+OPENBLAS_NUM_THREADS=1 python -m tools.bench_int8
+```
+
+The phase 8 target is llama.cpp Q8_0 at ~86 ms/token on that laptop. Whether
+this closes it is the open question. What it can already say is that the
+remaining ~18 ms per token on the synthetic run is not the kernels — they are
+~30 ms of a ~48 ms step — but the NumPy glue around them: SiLU's sigmoid alone
+costs 4.5 ms a token, in both paths.
 
 ## Parameter budget
 
@@ -851,6 +958,7 @@ nanoinfer/
   quantization.py     INT8 per-channel, INT4 group-wise, packing
   perplexity.py       held-out scoring, the quality instrument
   kernels.py          ctypes bridge to the Rust kernels, optional
+  linear.py           x @ W.T for fp32 or int8 weights; the one seam
   generate.py         the decode loop, greedy or sampled
 tools/
   download_model.py   four HTTPS GETs, no huggingface_hub
@@ -858,12 +966,14 @@ tools/
   generate.py         run the model from the command line
   measure_quantization.py  perplexity and footprint per precision level
   bench_kernels.py    rust kernels against OpenBLAS, alternating A/B
+  bench_int8.py       whole-model decode, fp32 against stored int8
   compare_llamacpp.py llama.cpp agreement check, run before any timing
   bench_llamacpp.py   the head-to-head, each engine at its best threads
 rust/
-  src/lib.rs          fp32 and int8 matvecs, AVX2, thread pool, C ABI
+  src/lib.rs          fp32 and int8 matvecs, batched int8, AVX2, pool, C ABI
   src/bin/bench.rs    the same kernels against this crate's scalar loop
   tests/matvec.rs     arithmetic; the boundary is tested from Python
+  tests/matmul.rs     batched kernel, bitwise against a loop of matvecs
 bench/
   benchmark.py        append-only measurement harness
   results.jsonl       every number ever recorded
@@ -903,7 +1013,10 @@ cd .. && python -m tools.bench_kernels
 python -m tools.compare_llamacpp --llama-cpp ../llama.cpp
 OPENBLAS_NUM_THREADS=6 python -m tools.bench_llamacpp --llama-cpp ../llama.cpp
 
-python -m pytest                                    # 728 tests
+# int8 weights in the forward pass, against fp32, whole-model decode
+python -m tools.bench_int8                          # --synthetic without the download
+
+python -m pytest                                    # 746 tests
 ```
 
 Run the model:
@@ -915,6 +1028,9 @@ python -m tools.generate --chat "Explain RoPE in one sentence."
 # sampling; --model-defaults uses Qwen2.5's own T=0.7 k=20 p=0.8
 python -m tools.generate --prompt "Once upon a time" --model-defaults --seed 1
 python -m tools.generate --prompt "Once upon a time" --temperature 0.9 --top-p 0.95 --seed 42
+
+# int8 weights through the Rust kernel (build it first: cd rust && cargo build --release)
+python -m tools.generate --prompt "The capital of France is" --int8 --int8-embeddings
 ```
 
 Look inside it while it runs:

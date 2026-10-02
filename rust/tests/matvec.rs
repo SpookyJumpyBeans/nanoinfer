@@ -177,6 +177,31 @@ fn simd_handles_a_ragged_tail() {
     }
 }
 
+#[test]
+fn simd_agrees_at_every_width_through_three_blocks() {
+    // The AVX2 dot product has three regions: 32-wide blocks over four
+    // accumulators, leftover 8-wide lanes, then a scalar tail. Every width
+    // from 1 to 100 crosses each boundary between them several times, and an
+    // off-by-one in any of them drops or double-counts a weight.
+    for in_features in 1..=100 {
+        let weights = pseudo_random(3 * in_features, 15);
+        let x = pseudo_random(in_features, 16);
+        let (quantized, scales) = quantize_rows_i8(&weights, 3);
+
+        let mut scalar = vec![0.0; 3];
+        matvec_i8(&quantized, &scales, &x, &mut scalar);
+        let mut simd = vec![0.0; 3];
+        matvec_i8_auto(&quantized, &scales, &x, &mut simd);
+
+        for (a, b) in scalar.iter().zip(&simd) {
+            assert!(
+                (a - b).abs() < a.abs().max(1.0) * 1e-4,
+                "width {in_features}: scalar {a} vs simd {b}"
+            );
+        }
+    }
+}
+
 use nanoinfer_kernels::{matvec_i8_parallel, matvec_i8_spawn_per_call};
 
 #[test]

@@ -72,6 +72,9 @@ def _load() -> ctypes.CDLL | None:
             function.argtypes = matvec_args
             function.restype = None
 
+        library.nanoinfer_matmul_i8.argtypes = matvec_args + [ctypes.c_size_t]
+        library.nanoinfer_matmul_i8.restype = None
+
         library.nanoinfer_has_avx2.argtypes = []
         library.nanoinfer_has_avx2.restype = ctypes.c_int
         library.nanoinfer_num_threads.argtypes = []
@@ -163,6 +166,57 @@ def matvec_i8(
         ctypes.c_size_t(in_features),
     )
     return out
+
+
+def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """``x @ (quantized * scales[:, None]).T`` for a batch of tokens, in Rust.
+
+    ``x`` is ``[tokens, in_features]`` and the result ``[tokens,
+    out_features]`` -- the shape ``x @ W.T`` has, so the forward pass can call
+    this wherever it would have written that.
+
+    One call per projection regardless of the batch size. Prefill would
+    otherwise cross the ctypes boundary once per prompt token per projection,
+    and each crossing costs ~8 us before any work is done. A batch of one is
+    a decode step and is bitwise the threaded :func:`matvec_i8`.
+    """
+    if _LIBRARY is None:
+        raise RuntimeError(
+            "the Rust kernels are not built; run `cargo build --release` in rust/"
+        )
+    if quantized.ndim != 2:
+        raise ValueError(f"expected a 2-D weight matrix, got shape {quantized.shape}")
+    if x.ndim != 2:
+        raise ValueError(f"expected [tokens, in_features] activations, got {x.shape}")
+
+    out_features, in_features = quantized.shape
+    tokens = x.shape[0]
+    if scales.shape != (out_features,):
+        raise ValueError(
+            f"expected one scale per output row: {scales.shape} against {out_features}"
+        )
+    if x.shape[1] != in_features:
+        raise ValueError(f"x has width {x.shape[1]}, weights expect {in_features}")
+    if tokens == 0:
+        return np.empty((0, out_features), dtype=np.float32)
+
+    quantized = _as_kernel_input(quantized, np.int8, "quantized")
+    scales = _as_kernel_input(scales, np.float32, "scales")
+    x = _as_kernel_input(x, np.float32, "x")
+
+    # Rust writes [out_features, tokens] so that each worker's rows are one
+    # contiguous block; the transpose back is a view, not a copy.
+    out_t = np.empty((out_features, tokens), dtype=np.float32)
+    _LIBRARY.nanoinfer_matmul_i8(
+        quantized.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+        scales.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        out_t.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ctypes.c_size_t(out_features),
+        ctypes.c_size_t(in_features),
+        ctypes.c_size_t(tokens),
+    )
+    return out_t.T
 
 
 def matvec_i8_numpy(

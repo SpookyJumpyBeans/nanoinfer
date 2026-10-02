@@ -148,9 +148,9 @@ def quantization_error(original: np.ndarray, restored: np.ndarray) -> dict[str, 
 # full speed, which is why it is the standard way to measure this (PyTorch
 # calls the same trick a quantize-dequantize, or QDQ, pass).
 #
-# The footprint reduction is real and reported separately; the speed win is not
-# available until phase 7 replaces these matmuls with kernels that can consume
-# integers directly.
+# The footprint reduction is real and reported separately. The speed win needs
+# a kernel that consumes integers directly; phase 7 wrote one, and
+# ``dequantize=False`` below is how the forward pass reaches it.
 
 LINEAR_FIELDS = (
     "q_proj_weight",
@@ -192,8 +192,18 @@ def quantize_model(
     bits: int = 8,
     quantize_embeddings: bool = False,
     group_size: int = INT4_GROUP_SIZE,
+    dequantize: bool = True,
 ):
     """Return a copy of ``weights`` with its linear layers quantized.
+
+    ``dequantize`` picks between the two things "quantized" can mean here.
+    True, the default, is the simulated quantization described above: every
+    weight is rounded to the integer grid and handed back as float32, which is
+    what the perplexity numbers measure. False keeps INT8 weights *as int8* --
+    :class:`QuantizedTensor` in place of each array -- so the forward pass
+    sends them to the Rust kernel and actually reads a quarter of the bytes.
+    The two compute on identical integer values and differ only in float32
+    summation order. INT4 has no kernel, so it is simulation only.
 
     ``quantize_embeddings`` is off by default. The embedding matrix is 27.6% of
     this model's parameters, so including it is tempting -- but it does double
@@ -209,6 +219,8 @@ def quantize_model(
 
     if bits not in (4, 8):
         raise ValueError(f"only INT4 and INT8 are implemented, got {bits}")
+    if bits == 4 and not dequantize:
+        raise ValueError("INT4 has no kernel to run on; use dequantize=True")
 
     if bits == 8:
         def quantizer(tensor):
@@ -222,14 +234,14 @@ def quantize_model(
     original_bytes = 0
     quantized_bytes = 0
 
-    def convert(tensor: np.ndarray) -> np.ndarray:
+    def convert(tensor: np.ndarray) -> np.ndarray | QuantizedTensor:
         nonlocal tensors, parameters, original_bytes, quantized_bytes
         packed = quantizer(tensor)
         tensors += 1
         parameters += tensor.size
         original_bytes += tensor.nbytes
         quantized_bytes += packed.nbytes
-        return packed.dequantize()
+        return packed.dequantize() if dequantize else packed
 
     new_layers = []
     for layer in weights.layers:
