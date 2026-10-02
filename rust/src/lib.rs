@@ -162,50 +162,114 @@ pub fn matvec_i8_auto(quantized: &[i8], scales: &[f32], x: &[f32], out: &mut [f3
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn matvec_i8_avx2(quantized: &[i8], scales: &[f32], x: &[f32], out: &mut [f32]) {
-    use std::arch::x86_64::*;
-
     let in_features = x.len();
     assert_eq!(quantized.len(), out.len() * in_features, "weight shape mismatch");
     assert_eq!(scales.len(), out.len(), "expected one scale per output row");
 
-    let chunks = in_features / 8;
-    let tail = chunks * 8;
-
     for (row, y) in out.iter_mut().enumerate() {
-        let w = quantized.as_ptr().add(row * in_features);
-
-        let mut acc = _mm256_setzero_ps();
-        for chunk in 0..chunks {
-            let offset = chunk * 8;
-
-            // Eight int8 -> eight i32 (sign-extended) -> eight f32. The whole
-            // widening happens in registers; no array is ever materialised.
-            let packed = _mm_loadl_epi64(w.add(offset) as *const __m128i);
-            let widened = _mm256_cvtepi8_epi32(packed);
-            let weights = _mm256_cvtepi32_ps(widened);
-
-            let activations = _mm256_loadu_ps(x.as_ptr().add(offset));
-            acc = _mm256_fmadd_ps(weights, activations, acc);
-        }
-
-        // Horizontal sum of the eight lanes. Done once per row, so its cost is
-        // amortised over in_features multiply-adds.
-        let high = _mm256_extractf128_ps(acc, 1);
-        let low = _mm256_castps256_ps128(acc);
-        let mut sum128 = _mm_add_ps(low, high);
-        sum128 = _mm_hadd_ps(sum128, sum128);
-        sum128 = _mm_hadd_ps(sum128, sum128);
-        let mut sum = _mm_cvtss_f32(sum128);
-
-        // Whatever did not fill a lane. in_features is 896 or 4864 for this
-        // model, both multiples of 8, so this is empty in practice -- but a
-        // kernel that silently drops the tail is a trap for the next shape.
-        for i in tail..in_features {
-            sum += (*w.add(i) as f32) * x[i];
-        }
-
-        *y = sum * scales[row];
+        let w = &quantized[row * in_features..(row + 1) * in_features];
+        *y = dot_i8_avx2(w, x) * scales[row];
     }
+}
+
+/// How far ahead of the current block the AVX2 dot product prefetches.
+#[cfg(target_arch = "x86_64")]
+const PREFETCH_BYTES: usize = 4096;
+
+/// One int8 row against one float32 vector, unscaled.
+///
+/// Split out of the matvec so the batched kernel below runs *exactly* the
+/// same instructions per row. That is what lets the tests demand bitwise
+/// equality between one batched call and a loop of matvecs, rather than a
+/// tolerance that could hide a real difference.
+///
+/// # Safety
+/// AVX2 and FMA must be available, and `w.len() == x.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[inline]
+unsafe fn dot_i8_avx2(w: &[i8], x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let in_features = x.len();
+    let w = w.as_ptr();
+    let x = x.as_ptr();
+
+    // Four independent accumulators, 32 weights per iteration. With one
+    // accumulator every FMA waits ~4 cycles on the previous one; four chains
+    // let the core overlap them. That doubled the cache-hot speed and did
+    // nothing for whole-model decode, which streams from DRAM -- the prefetch
+    // below is what fixed that.
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    // Eight int8 -> eight i32 (sign-extended) -> eight f32. The whole
+    // widening happens in registers; no array is ever materialised.
+    let widen = |bytes: __m128i| _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes));
+
+    let wide = in_features / 32 * 32;
+    let mut offset = 0;
+    while offset < wide {
+        // Ask for the weights PREFETCH_BYTES ahead now, so they are in flight
+        // while this block is being multiplied. Rows are contiguous, so near
+        // the end of a row this reaches into the next one -- which is exactly
+        // the row this thread will read next.
+        _mm_prefetch::<_MM_HINT_T0>(w.add(offset + PREFETCH_BYTES) as *const i8);
+        let low = _mm_loadu_si128(w.add(offset) as *const __m128i);
+        let high = _mm_loadu_si128(w.add(offset + 16) as *const __m128i);
+
+        acc0 = _mm256_fmadd_ps(widen(low), _mm256_loadu_ps(x.add(offset)), acc0);
+        acc1 = _mm256_fmadd_ps(
+            widen(_mm_srli_si128(low, 8)),
+            _mm256_loadu_ps(x.add(offset + 8)),
+            acc1,
+        );
+        acc2 = _mm256_fmadd_ps(widen(high), _mm256_loadu_ps(x.add(offset + 16)), acc2);
+        acc3 = _mm256_fmadd_ps(
+            widen(_mm_srli_si128(high, 8)),
+            _mm256_loadu_ps(x.add(offset + 24)),
+            acc3,
+        );
+        offset += 32;
+    }
+
+    // Leftover whole lanes of eight, into the first chain.
+    let tail = in_features / 8 * 8;
+    while offset < tail {
+        let packed = _mm_loadl_epi64(w.add(offset) as *const __m128i);
+        acc0 = _mm256_fmadd_ps(widen(packed), _mm256_loadu_ps(x.add(offset)), acc0);
+        offset += 8;
+    }
+
+    // Combine the chains in a fixed order, then the horizontal sum of the
+    // eight lanes. Done once per row, so its cost is amortised over
+    // in_features multiply-adds.
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let high = _mm256_extractf128_ps(acc, 1);
+    let low = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(low, high);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut sum = _mm_cvtss_f32(sum128);
+
+    // Whatever did not fill a lane. in_features is 896 or 4864 for this
+    // model, both multiples of 32, so this is empty in practice -- but a
+    // kernel that silently drops the tail is a trap for the next shape.
+    for i in tail..in_features {
+        sum += (*w.add(i) as f32) * *x.add(i);
+    }
+    sum
+}
+
+/// The scalar counterpart of [`dot_i8_avx2`], same order as [`matvec_i8`].
+fn dot_i8_scalar(w: &[i8], x: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for i in 0..x.len() {
+        sum += (w[i] as f32) * x[i];
+    }
+    sum
 }
 
 // -- multithreading --------------------------------------------------------
@@ -312,6 +376,103 @@ pub fn matvec_i8_parallel(quantized: &[i8], scales: &[f32], x: &[f32], out: &mut
         });
 }
 
+// -- batched: more than one token ------------------------------------------
+//
+// Decode is one token at a time, but prefill is the whole prompt at once, and
+// so is a perplexity pass. Calling the matvec once per token from Python would
+// pay the ~8 us ctypes floor `tokens x 7 x 24` times, and stream every weight
+// in from memory once per token.
+//
+// So the loop over tokens goes inside the loop over weight rows. Each row is
+// read from memory once and then stays in L1 while every token is dotted
+// against it. Results land transposed, `[out_features, tokens]`, which keeps
+// each worker's output a single contiguous block: it owns a run of rows, and
+// in this layout those rows are adjacent. Python transposes the view back.
+
+/// int8 weights times `tokens` activation vectors, single-threaded.
+///
+/// `x` is row-major `[tokens, in_features]`; `out_t` is row-major
+/// `[out_features, tokens]` -- note the transpose. Each output is computed by
+/// the same per-row dot product as [`matvec_i8_auto`], so a batch of one is
+/// bitwise identical to a matvec, and a batch of n to n matvecs.
+pub fn matmul_i8_auto(
+    quantized: &[i8],
+    scales: &[f32],
+    x: &[f32],
+    tokens: usize,
+    out_t: &mut [f32],
+) {
+    let out_features = scales.len();
+    assert!(tokens > 0, "expected at least one token");
+    assert_eq!(x.len() % tokens, 0, "activation shape mismatch");
+    let in_features = x.len() / tokens;
+    assert_eq!(quantized.len(), out_features * in_features, "weight shape mismatch");
+    assert_eq!(out_t.len(), out_features * tokens, "output shape mismatch");
+
+    #[cfg(target_arch = "x86_64")]
+    let simd = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let simd = false;
+
+    for row in 0..out_features {
+        let w = &quantized[row * in_features..(row + 1) * in_features];
+        let scale = scales[row];
+        for t in 0..tokens {
+            let xt = &x[t * in_features..(t + 1) * in_features];
+            #[cfg(target_arch = "x86_64")]
+            let dot = if simd {
+                // SAFETY: feature-checked above; slices are equal length.
+                unsafe { dot_i8_avx2(w, xt) }
+            } else {
+                dot_i8_scalar(w, xt)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let dot = {
+                let _ = simd;
+                dot_i8_scalar(w, xt)
+            };
+            out_t[row * tokens + t] = dot * scale;
+        }
+    }
+}
+
+/// [`matmul_i8_auto`] split across the pool by blocks of output rows.
+///
+/// The same decomposition as [`matvec_i8_parallel`], and the same threshold
+/// below which the wakeup costs more than the rows.
+pub fn matmul_i8_parallel(
+    quantized: &[i8],
+    scales: &[f32],
+    x: &[f32],
+    tokens: usize,
+    out_t: &mut [f32],
+) {
+    let out_features = scales.len();
+    assert!(tokens > 0, "expected at least one token");
+    assert_eq!(x.len() % tokens, 0, "activation shape mismatch");
+    let in_features = x.len() / tokens;
+    assert_eq!(quantized.len(), out_features * in_features, "weight shape mismatch");
+    assert_eq!(out_t.len(), out_features * tokens, "output shape mismatch");
+
+    let threads = rayon::current_num_threads();
+    if threads <= 1 || out_features < threads * 8 {
+        return matmul_i8_auto(quantized, scales, x, tokens, out_t);
+    }
+
+    let rows_per_thread = out_features.div_ceil(threads);
+
+    out_t
+        .par_chunks_mut(rows_per_thread * tokens)
+        .enumerate()
+        .for_each(|(block_index, chunk)| {
+            let row_start = block_index * rows_per_thread;
+            let rows = chunk.len() / tokens;
+            let weights = &quantized[row_start * in_features..(row_start + rows) * in_features];
+            let block_scales = &scales[row_start..row_start + rows];
+            matmul_i8_auto(weights, block_scales, x, tokens, chunk);
+        });
+}
+
 // -- C ABI --------------------------------------------------------------
 //
 // The engine is NumPy, so the kernels have to be reachable from Python. This
@@ -387,4 +548,31 @@ pub unsafe extern "C" fn nanoinfer_matvec_i8_single(
     let x = std::slice::from_raw_parts(x, in_features);
     let out = std::slice::from_raw_parts_mut(out, out_features);
     matvec_i8_auto(quantized, scales, x, out);
+}
+
+/// Batched int8 matmul over the thread pool; see [`matmul_i8_parallel`].
+///
+/// This is the one the engine calls. A batch of one is a decode step, so the
+/// forward pass needs no separate matvec path.
+///
+/// # Safety
+/// `quantized` must point to `out_features * in_features` readable bytes,
+/// `scales` to `out_features` floats, `x` to `tokens * in_features` floats,
+/// and `out_t` to `out_features * tokens` writable floats. No aliasing between
+/// `out_t` and the rest.
+#[no_mangle]
+pub unsafe extern "C" fn nanoinfer_matmul_i8(
+    quantized: *const i8,
+    scales: *const f32,
+    x: *const f32,
+    out_t: *mut f32,
+    out_features: usize,
+    in_features: usize,
+    tokens: usize,
+) {
+    let quantized = std::slice::from_raw_parts(quantized, out_features * in_features);
+    let scales = std::slice::from_raw_parts(scales, out_features);
+    let x = std::slice::from_raw_parts(x, tokens * in_features);
+    let out_t = std::slice::from_raw_parts_mut(out_t, out_features * tokens);
+    matmul_i8_parallel(quantized, scales, x, tokens, out_t);
 }
