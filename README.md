@@ -608,6 +608,48 @@ remaining ~18 ms per token on the synthetic run is not the kernels — they are
 ~30 ms of a ~48 ms step — but the NumPy glue around them: SiLU's sigmoid alone
 costs 4.5 ms a token, in both paths.
 
+### Prefill, the sigmoid, and the ctypes floor
+
+Three follow-ups to the profile above, each measured on the same 4-core VM
+with the same synthetic weights, and none of them changing a single output
+bit:
+
+| ms/token | before | after |
+|---|---:|---:|
+| int8 + embed decode, `OPENBLAS_NUM_THREADS=1` | 45.1 | **40.4** |
+| int8 + embed prefill, `OPENBLAS_NUM_THREADS=1` | 13.9 | **8.5** |
+| fp32 decode, `OPENBLAS_NUM_THREADS=4` | 52.0 | **47.8** |
+
+**Prefill widens each row once.** The batched kernel re-widened every int8
+weight for every token, so a 32-token prompt paid for the conversion 32 times.
+It now widens a row into an L1-sized buffer once per block of tokens, walks
+tokens in blocks whose activations fit in L2, and dots three tokens per pass
+so each weight load feeds three FMAs instead of one. int8 → f32 is exact and
+every token keeps its own four accumulator chains in the same order, so a
+prompt processed in one call is still bitwise the same prompt processed token
+by token — `tests/matmul.rs` now crosses a token-block boundary to prove it.
+
+It is still behind fp32 BLAS on large batches, by 1.8–2.4× per projection at
+128 tokens. Closing that needs a GEMM-style microkernel, which sums each
+output in a different order from the decode kernel and would give up the
+bitwise match; that trade is not made here. One trap while measuring it: this
+VM's OpenBLAS picks its AVX-512 `SkylakeX` kernels at runtime, which the i7-12700H
+does not have. `OPENBLAS_CORETYPE=Haswell` forces the kernel the laptop would
+run, and the per-projection comparison above uses it.
+
+**The sigmoid no longer splits the array.** It computed each sign's half with
+boolean masks and scattered the halves back. Both halves share
+`e = exp(-|x|)` — the result is `1/(1+e)` on one side and `e/(1+e)` on the
+other — so one `np.where` computes the identical expression per element:
+bitwise the same, 118 → 27 µs per 4864-wide call, about 2 ms a token. The
+fp32 path gets it too.
+
+**The ctypes floor halved.** `data_as()` builds a typed pointer object per
+array per call, and it was 40% of an empty call. The engine's entry point now
+takes raw addresses (`c_void_p` and `arr.ctypes.data`); `_as_kernel_input`
+already enforces dtype and contiguity on the Python side. An empty call went
+11.9 → 5.6 µs, which at 169 calls a token is about 1 ms.
+
 ## Parameter budget
 
 | | Parameters | Share |
