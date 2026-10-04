@@ -32,7 +32,7 @@ import numpy as np
 from nanoinfer.attention import self_attention
 from nanoinfer.config import ModelConfig
 from nanoinfer.kvcache import KVCache
-from nanoinfer.linear import gather_rows, linear
+from nanoinfer.linear import gather_rows, linear, linear_many
 from nanoinfer.ops import rms_norm, silu
 from nanoinfer.rope import RotaryEmbedding
 from nanoinfer.weights import LayerWeights, ModelWeights
@@ -49,8 +49,7 @@ def feed_forward(hidden: np.ndarray, layer: LayerWeights) -> np.ndarray:
 
     This is where two thirds of the model's parameters live.
     """
-    gate = linear(hidden, layer.gate_proj_weight)
-    up = linear(hidden, layer.up_proj_weight)
+    gate, up = linear_many(hidden, [layer.gate_proj_weight, layer.up_proj_weight])
     return linear(silu(gate) * up, layer.down_proj_weight)
 
 

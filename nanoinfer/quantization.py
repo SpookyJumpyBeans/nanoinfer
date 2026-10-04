@@ -246,6 +246,9 @@ def quantize_model(
     new_layers = []
     for layer in weights.layers:
         replacements = {field: convert(getattr(layer, field)) for field in LINEAR_FIELDS}
+        if not dequantize:
+            for group in FUSED_GROUPS:
+                replacements.update(_store_adjacent({f: replacements[f] for f in group}))
         new_layers.append(dataclasses.replace(layer, **replacements))
 
     embed = convert(weights.embed_tokens) if quantize_embeddings else weights.embed_tokens
@@ -263,6 +266,37 @@ def quantize_model(
         embeddings_quantized=quantize_embeddings,
     )
     return quantized, report
+
+
+# Projections that read the same activations. Stored back to back, each group
+# is one matrix, and nanoinfer.linear.linear_many runs it as one kernel call.
+FUSED_GROUPS = (
+    ("q_proj_weight", "k_proj_weight", "v_proj_weight"),
+    ("gate_proj_weight", "up_proj_weight"),
+)
+
+
+def _store_adjacent(tensors: dict[str, QuantizedTensor]) -> dict[str, QuantizedTensor]:
+    """Re-home a group of per-row INT8 tensors into one buffer, rows in order.
+
+    Each returned tensor is a row slice of the shared buffer, holding exactly
+    the integers and scales it held before -- per-row quantization does not
+    care which other rows share its array. Only where they live changes.
+    """
+    names = list(tensors)
+    values = np.concatenate([tensors[n].values for n in names])
+    scales = np.concatenate([tensors[n].scales for n in names])
+
+    out, start = {}, 0
+    for name in names:
+        rows = tensors[name].values.shape[0]
+        out[name] = QuantizedTensor(
+            values=values[start : start + rows],
+            scales=scales[start : start + rows],
+            bits=8,
+        )
+        start += rows
+    return out
 
 
 # -- INT4 ------------------------------------------------------------------

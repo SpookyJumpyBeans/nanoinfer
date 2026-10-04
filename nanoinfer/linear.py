@@ -49,6 +49,77 @@ def linear(x: np.ndarray, weight: Weight) -> np.ndarray:
     return (x @ weight.values.T.astype(np.float32)) * weight.scales
 
 
+def linear_many(x: np.ndarray, weights: list[Weight]) -> list[np.ndarray]:
+    """``[linear(x, w) for w in weights]``, in one kernel call when it can be.
+
+    Q, K and V all read the same activations, and so do gate and up. Called
+    one at a time that is seven trips into Rust per layer, and K and V are
+    each 128 rows -- less work than the ~6 us a call costs before anything
+    happens. When :func:`~nanoinfer.quantization.quantize_model` has stored a
+    group's int8 rows back to back in one buffer, the group is one matrix
+    already, and this makes a single call over all of its rows and splits
+    the result.
+
+    In the Rust kernel every output row is its own dot product, so the one
+    call returns exactly the bits the separate calls would. (The NumPy
+    fallback is one BLAS matmul instead, equal to float32 tolerance.)
+    Anything else -- fp32 weights, int8 weights stored apart -- takes the
+    separate calls, unchanged.
+    """
+    fused = _adjacent_int8(weights)
+    if fused is None:
+        return [linear(x, w) for w in weights]
+
+    combined = linear(x, fused)
+    outputs, start = [], 0
+    for weight in weights:
+        rows = weight.values.shape[0]
+        outputs.append(combined[:, start : start + rows])
+        start += rows
+    return outputs
+
+
+def _adjacent_int8(weights: list[Weight]) -> QuantizedTensor | None:
+    """One tensor spanning ``weights`` if they are consecutive int8 row blocks.
+
+    True only when every weight is per-row INT8 and both its values and its
+    scales sit immediately after the previous weight's, inside one buffer --
+    which is how ``quantize_model(dequantize=False)`` lays out each group. A
+    view over the span is then exactly the stacked matrix, with no copy.
+    """
+    if len(weights) < 2 or not all(
+        isinstance(w, QuantizedTensor) and w.bits == 8 for w in weights
+    ):
+        return None
+
+    first = weights[0]
+    values_base, scales_base = first.values.base, first.scales.base
+    if values_base is None or scales_base is None:
+        return None
+
+    in_features = first.values.shape[1]
+    for before, after in zip(weights, weights[1:]):
+        for name, base in (("values", values_base), ("scales", scales_base)):
+            a, b = getattr(before, name), getattr(after, name)
+            if b.base is not base or not b.flags.c_contiguous:
+                return None
+            if b.ctypes.data != a.ctypes.data + a.nbytes:
+                return None
+        if after.values.shape[1] != in_features:
+            return None
+
+    rows = sum(w.values.shape[0] for w in weights)
+    values = np.ndarray(
+        (rows, in_features), dtype=np.int8, buffer=values_base,
+        offset=first.values.ctypes.data - values_base.ctypes.data,
+    )
+    scales = np.ndarray(
+        (rows,), dtype=np.float32, buffer=scales_base,
+        offset=first.scales.ctypes.data - scales_base.ctypes.data,
+    )
+    return QuantizedTensor(values=values, scales=scales, bits=8)
+
+
 def gather_rows(weight: Weight, ids: np.ndarray) -> np.ndarray:
     """Rows of a weight matrix as float32: the embedding lookup.
 
