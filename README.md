@@ -28,7 +28,7 @@ against the uncached path. [More below.](#running-it)
 | 4 | KV cache; identical output, measured speedup | **done** |
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
-| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done and wired in**, WebGPU not started |
+| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done and wired in**; WebGPU kernel written and verified, not yet timed on a GPU |
 | 8 | Benchmark against llama.cpp on identical hardware | **done** |
 
 Each phase is verified against a reference implementation before the next one
@@ -388,8 +388,9 @@ The int8 projections are now wired into the forward pass — see
 [phase 7, finished](#phase-7-finished--int8-in-the-forward-pass) after phase 8,
 which is what made it worth doing.
 
-**WebGPU is not started.** Phase 7 was scoped as CPU SIMD first, then compute
-shaders; the CPU half is done and measured, and the GPU half is not begun.
+**WebGPU is started** — see [the GPU half](#phase-7-the-gpu-half--started):
+the int8 kernel is written as a compute shader and verified against the CPU
+kernel, but has not yet run on a real GPU or been wired into the engine.
 
 ### Phase 8 — llama.cpp as a reference
 
@@ -672,6 +673,58 @@ crossings account for. The rest is the pool: every call wakes rayon's workers
 and joins them again, and K and V were 128 rows each — 32 rows per thread on
 four cores, almost nothing but the wakeup and the join. Prefill moves the same
 weights and does the same arithmetic either way, and does not change.
+
+### Phase 7, the GPU half — started
+
+The int8 matmul now exists as a WebGPU compute shader, in its own crate,
+`gpu/`. The CPU crate keeps its one dependency and its seconds-long build;
+wgpu is a graphics stack, and nothing that uses the CPU kernels should have
+to compile it.
+
+**What it does.** A `GpuMatrix` is uploaded once and stays resident, so a
+decode step moves only the 896 activations up and the outputs back; moving
+the weights per token would throw away the point. WGSL has no 8-bit type, so
+each row goes up packed four int8 to a `u32`, and `extractBits` on an `i32`
+sign-extends them back. int8 → f32 is exact, so the shader multiplies exactly
+the integers the CPU kernel does. One workgroup of 64 threads computes one
+output: each thread sums a strided slice of the row, a tree in workgroup
+memory folds the 64 partial sums, and the scale is applied once at the end.
+
+**Verified against the CPU kernel**, not to the bit — the shader adds in a
+different order (64 slices, then a tree) from the CPU's four chains of eight
+lanes, and float addition does not associate — but to float32 tolerance, on
+every decode shape, a batch of tokens, widths that need padding to a multiple
+of four, and a hand-worked case. A shader with its scale off by 0.1% fails
+the tests, so the tolerance has teeth.
+
+**Two limits the LM head runs into.** WebGPU caps a dispatch at 65,535
+workgroups per dimension and the LM head has 151,936 rows, so rows run along
+x and wrap into y. And a device may cap one storage binding at 128 MiB —
+Mesa's llvmpipe does — while the int8 LM head is 130 MiB, so a large matrix
+is uploaded as row chunks that each fit, one dispatch per chunk in a single
+submission, each writing its own rows of the shared output. Both have tests:
+70,000 rows for the wrap, and a matrix forced into seven uneven chunks that
+must match the same matrix uploaded whole.
+
+**What is not known yet: how fast it is.** There is no GPU where this was
+built. The tests and the benchmark ran on llvmpipe, Mesa's software Vulkan
+driver, which executes the shader on the CPU — right for checking the
+arithmetic, meaningless for timing it, and the benchmark prints a warning
+rather than a number when it detects one. The real measurement is on the
+Iris Xe:
+
+```
+cd gpu && cargo test --release && cargo run --release --example bench
+```
+
+Two things that will matter there, stated now so the result can be read
+against them. Iris Xe is integrated: it shares DRAM with the CPU, so its
+bandwidth for the weights is the same ~24 GB/s the CPU sees, and the win, if
+there is one, is in arithmetic and in freeing the CPU, not in bytes. And each
+call is a round trip — upload, dispatch, map, read back — whose fixed cost
+the benchmark includes; decode makes 97 such calls a token, so the next step
+after timing is to keep the activations on the GPU between layers rather than
+crossing the boundary for every projection.
 
 ## Parameter budget
 
@@ -1039,6 +1092,11 @@ rust/
   src/bin/bench.rs    the same kernels against this crate's scalar loop
   tests/matvec.rs     arithmetic; the boundary is tested from Python
   tests/matmul.rs     batched kernel, bitwise against a loop of matvecs
+gpu/
+  src/matmul_i8.wgsl  the int8 matmul as a WebGPU compute shader
+  src/lib.rs          device setup, resident weights, chunked upload, dispatch
+  tests/matmul.rs     the shader against the CPU kernel, to float32 tolerance
+  examples/bench.rs   per-projection GPU vs CPU; refuses to time a software GPU
 bench/
   benchmark.py        append-only measurement harness
   results.jsonl       every number ever recorded
@@ -1073,6 +1131,9 @@ python -m tools.measure_quantization int4 --group-size 32
 # rust kernels; entirely optional, the engine runs without them
 cd rust && cargo test --release && cargo run --release --bin bench
 cd .. && python -m tools.bench_kernels
+
+# WebGPU kernel; needs a GPU (or a software Vulkan driver, for tests only)
+cd gpu && cargo test --release && cargo run --release --example bench && cd ..
 
 # llama.cpp, verified first and only then timed
 python -m tools.compare_llamacpp --llama-cpp ../llama.cpp
