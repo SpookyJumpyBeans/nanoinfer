@@ -251,3 +251,87 @@ def test_real_model_int8_generates_what_simulation_does():
         expected = list(greedy_stream(simulated, ids, max_new_tokens=32))
         actual = list(greedy_stream(stored, ids, max_new_tokens=32))
         assert actual == expected, prompt
+
+
+# -- fused projections -----------------------------------------------------
+
+
+from nanoinfer.linear import _adjacent_int8, linear_many  # noqa: E402
+from nanoinfer.quantization import FUSED_GROUPS  # noqa: E402
+
+
+def test_stored_groups_are_laid_out_back_to_back(tiny_weights):
+    stored, _ = quantize_model(tiny_weights, bits=8, dequantize=False)
+    for layer in stored.layers:
+        for group in FUSED_GROUPS:
+            fused = _adjacent_int8([getattr(layer, f) for f in group])
+            assert fused is not None, group
+            assert fused.values.shape[0] == sum(getattr(layer, f).values.shape[0] for f in group)
+
+
+def test_fused_call_is_bitwise_the_separate_calls(tiny_weights, rng):
+    stored, _ = quantize_model(tiny_weights, bits=8, dequantize=False)
+    layer = stored.layers[0]
+    x = rng.standard_normal((5, 16)).astype(np.float32)
+    for group in FUSED_GROUPS:
+        weights = [getattr(layer, f) for f in group]
+        for fused, alone in zip(linear_many(x, weights), (linear(x, w) for w in weights)):
+            np.testing.assert_array_equal(fused, alone)
+
+
+def test_fused_fallback_computes_the_same_thing(tiny_weights, rng, monkeypatch):
+    """Without Rust the fused call is one BLAS matmul, which may block a wider
+    matrix differently -- so float32 tolerance here, not bits."""
+    stored, _ = quantize_model(tiny_weights, bits=8, dequantize=False)
+    weights = [getattr(stored.layers[0], f) for f in FUSED_GROUPS[0]]
+    x = rng.standard_normal((3, 16)).astype(np.float32)
+    monkeypatch.setattr(kernels, "_LIBRARY", None)
+    for fused, alone in zip(linear_many(x, weights), (linear(x, w) for w in weights)):
+        np.testing.assert_allclose(fused, alone, rtol=1e-6, atol=1e-6)
+
+
+def test_weights_stored_apart_are_not_fused(rng):
+    """Separately quantized tensors live in separate buffers: no false merge."""
+    a = quantize_int8(rng.standard_normal((8, 16)).astype(np.float32))
+    b = quantize_int8(rng.standard_normal((4, 16)).astype(np.float32))
+    assert _adjacent_int8([a, b]) is None
+
+    x = rng.standard_normal((2, 16)).astype(np.float32)
+    first, second = linear_many(x, [a, b])
+    np.testing.assert_array_equal(first, linear(x, a))
+    np.testing.assert_array_equal(second, linear(x, b))
+
+
+def test_out_of_order_rows_are_not_fused(tiny_weights):
+    """k then q is adjacent in neither direction that would be correct."""
+    stored, _ = quantize_model(tiny_weights, bits=8, dequantize=False)
+    layer = stored.layers[0]
+    assert _adjacent_int8([layer.k_proj_weight, layer.q_proj_weight]) is None
+    assert _adjacent_int8([layer.q_proj_weight, layer.v_proj_weight]) is None
+
+
+def test_fp32_weights_keep_their_own_calls(rng):
+    w1 = rng.standard_normal((8, 16)).astype(np.float32)
+    w2 = rng.standard_normal((4, 16)).astype(np.float32)
+    x = rng.standard_normal((2, 16)).astype(np.float32)
+    first, second = linear_many(x, [w1, w2])
+    np.testing.assert_array_equal(first, x @ w1.T)
+    np.testing.assert_array_equal(second, x @ w2.T)
+
+
+@needs_kernels
+def test_a_decode_step_makes_four_kernel_calls_per_layer(tiny_weights, monkeypatch):
+    """QKV, o_proj, gate+up, down -- plus the LM head when embeddings are int8."""
+    stored, _ = quantize_model(
+        tiny_weights, bits=8, quantize_embeddings=True, dequantize=False
+    )
+    model = Qwen2(stored)
+    cache = model.new_cache(8)
+    model.next_token_logits(np.array([5, 17, 3]), cache=cache)
+
+    calls = []
+    real = kernels.matmul_i8
+    monkeypatch.setattr(kernels, "matmul_i8", lambda *a: calls.append(1) or real(*a))
+    model.next_token_logits(np.array([22]), cache=cache)
+
+    assert len(calls) == 4 * len(stored.layers) + 1

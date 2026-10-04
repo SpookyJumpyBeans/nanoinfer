@@ -650,6 +650,29 @@ takes raw addresses (`c_void_p` and `arr.ctypes.data`); `_as_kernel_input`
 already enforces dtype and contiguity on the Python side. An empty call went
 11.9 → 5.6 µs, which at 169 calls a token is about 1 ms.
 
+### Seven calls a layer become four
+
+Q, K and V all read the same activations, and so do gate and up. When
+`quantize_model(dequantize=False)` stores each group's int8 rows back to back
+in one buffer, the group already *is* one matrix, and `linear_many` runs it as
+a single kernel call over all of its rows and splits the result. Each output
+row is its own dot product, so the one call returns exactly the bits the
+separate calls did — asserted bitwise. fp32 weights, and int8 weights stored
+apart, take the separate calls as before.
+
+| int8 + embed, `OPENBLAS_NUM_THREADS=1` | decode, ms/token | prefill, ms/token |
+|---|---:|---:|
+| separate calls | 46.1 / 50.5 | 9.1 / 9.7 |
+| fused | **40.9 / 40.7** | 9.2 / 9.0 |
+
+*Alternating A/B in one process, run twice with the order swapped.*
+
+That is 10–20% of decode, far more than the ~0.4 ms the 72 saved ctypes
+crossings account for. The rest is the pool: every call wakes rayon's workers
+and joins them again, and K and V were 128 rows each — 32 rows per thread on
+four cores, almost nothing but the wakeup and the join. Prefill moves the same
+weights and does the same arithmetic either way, and does not change.
+
 ## Parameter budget
 
 | | Parameters | Share |
