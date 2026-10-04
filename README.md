@@ -29,7 +29,7 @@ against the uncached path. [More below.](#running-it)
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
 | 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done, wired in, AVX-VNNI**; WebGPU measured and rejected |
-| 8 | Benchmark against llama.cpp on identical hardware | **done — and beaten, 32.45 vs 38.79 ms/token** |
+| 8 | Benchmark against llama.cpp on identical hardware | **done** — faster (32.45 vs 38.79 ms/tok) at 3.5× the quality cost |
 
 Each phase is verified against a reference implementation before the next one
 starts. Correctness first; a fast wrong answer teaches nothing.
@@ -480,11 +480,36 @@ inside each rep, each at its own best thread count:
 | llama.cpp f32 | 3 | 15.73 | 80.65 | 12.40 |
 | llama.cpp Q8_0 | 1 | 14.93 | 38.79 | 25.78 |
 
-**This engine decodes faster than llama.cpp: 32.45 against 38.79 ms/token.**
-Twelve of twelve paired reps favour it, the worst by 1.06× and the best by
-1.37×, so there is no rep llama.cpp won. Three independent runs put the ratio at
-1.21×, 1.24× and 1.20× — the absolute numbers move with machine load, the ratio
-does not. Prefill is now a tie rather than a 2–3× loss.
+**This engine decodes faster than llama.cpp — 32.45 against 38.79 ms/token —
+and pays 3.5× more quality to do it.** The speed is solid: twelve of twelve
+paired reps favour it, the worst by 1.06× and the best by 1.37×, so there is no
+rep llama.cpp won, and three independent runs put the ratio at 1.21×, 1.24× and
+1.20×. Prefill is now a tie rather than a 2–3× loss.
+
+The quality is where it loses. Perplexity on 512 held-out tokens, each engine
+against **its own** f32 baseline, since the two harnesses disagree on absolutes:
+
+| | f32 | int8 | cost |
+|---|---:|---:|---:|
+| llama.cpp Q8_0 | 17.9717 | 18.1280 | **+0.87%** |
+| nanoinfer int8, f32 activations | 23.2690 | 23.3133 | +0.19% |
+| nanoinfer int8 + VNNI | 23.2690 | 23.9746 | **+3.03%** |
+
+So the honest statement is not "faster than llama.cpp" but *faster at a worse
+operating point*: 1.20× the speed for 3.5× the perplexity cost. Greedy decoding
+diverges from the float-activation path at token 8 of 32.
+
+The cause is almost certainly scale granularity, and it is phase 6's
+per-tensor-versus-per-channel argument arriving on the activation side. This
+kernel uses **one scale per 896-value activation row**; llama.cpp's Q8_0 and
+Q8_1 use **one scale per 32-value block**. A single outlier in a row flattens
+the resolution of everything beside it, which is exactly what per-channel
+weight scales were introduced to avoid. Block-wise activation scales are the
+obvious next move and would cost one float per 32 values — about 3% overhead on
+the activations, against recovering most of 2.84%.
+
+Until that is done, VNNI is a speed/quality trade rather than a win, which is
+why it stays off by default.
 
 ### Why the earlier kernel was leaving it on the table
 
