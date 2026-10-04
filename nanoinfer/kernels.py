@@ -72,7 +72,11 @@ def _load() -> ctypes.CDLL | None:
             function.argtypes = matvec_args
             function.restype = None
 
-        library.nanoinfer_matmul_i8.argtypes = matvec_args + [ctypes.c_size_t]
+        # The engine's entry point takes raw addresses (c_void_p) rather than
+        # typed pointers. Building a POINTER object per array with data_as()
+        # was ~40% of an otherwise empty call -- 169 calls a token, ~3 ms --
+        # and the typing it buys is already enforced by _as_kernel_input.
+        library.nanoinfer_matmul_i8.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 3
         library.nanoinfer_matmul_i8.restype = None
 
         library.nanoinfer_has_avx2.argtypes = []
@@ -208,13 +212,13 @@ def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.nd
     # contiguous block; the transpose back is a view, not a copy.
     out_t = np.empty((out_features, tokens), dtype=np.float32)
     _LIBRARY.nanoinfer_matmul_i8(
-        quantized.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
-        scales.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_t.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_size_t(out_features),
-        ctypes.c_size_t(in_features),
-        ctypes.c_size_t(tokens),
+        quantized.ctypes.data,
+        scales.ctypes.data,
+        x.ctypes.data,
+        out_t.ctypes.data,
+        out_features,
+        in_features,
+        tokens,
     )
     return out_t.T
 

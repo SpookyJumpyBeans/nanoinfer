@@ -414,26 +414,199 @@ pub fn matmul_i8_auto(
     #[cfg(not(target_arch = "x86_64"))]
     let simd = false;
 
-    for row in 0..out_features {
-        let w = &quantized[row * in_features..(row + 1) * in_features];
-        let scale = scales[row];
-        for t in 0..tokens {
-            let xt = &x[t * in_features..(t + 1) * in_features];
+    // One token is a decode step: stream the int8 row straight through the
+    // prefetching dot product, with nothing to amortise a widened copy over.
+    if tokens == 1 {
+        for (row, y) in out_t.iter_mut().enumerate() {
+            let w = &quantized[row * in_features..(row + 1) * in_features];
+            *y = dot_i8(simd, w, x) * scales[row];
+        }
+        return;
+    }
+
+    // More than one token: widen each row to f32 ONCE and dot every token in
+    // the block against the widened copy. Re-widening per token made the
+    // conversion -- not the multiply -- the cost, and left int8 prefill 2-6x
+    // behind fp32 BLAS. int8 -> f32 is exact, so the widened row holds the
+    // very values the int8 dot would have produced in registers, and
+    // dot_f32 adds them in the same order: the result is bitwise unchanged.
+    //
+    // Tokens go in blocks whose activations fit in L2. A long prompt against
+    // a 4864-wide down_proj is 2.5 MB of activations; walking all of it for
+    // every row streamed it from L3 once per row.
+    let block = (TOKEN_BLOCK_BYTES / (in_features * 4)).max(1);
+    let mut widened = vec![0.0f32; in_features];
+
+    for first in (0..tokens).step_by(block) {
+        let last = (first + block).min(tokens);
+        for row in 0..out_features {
+            let w = &quantized[row * in_features..(row + 1) * in_features];
+            for (dst, &src) in widened.iter_mut().zip(w) {
+                *dst = src as f32;
+            }
+            let scale = scales[row];
+            let token = |t: usize| &x[t * in_features..(t + 1) * in_features];
+            let mut t = first;
+
+            // Three tokens per pass over the widened row: each weight load
+            // then feeds three FMAs instead of one, which is what the
+            // one-token dot was starved of -- two loads per FMA saturate the
+            // load ports long before the FMA units are busy.
             #[cfg(target_arch = "x86_64")]
-            let dot = if simd {
-                // SAFETY: feature-checked above; slices are equal length.
-                unsafe { dot_i8_avx2(w, xt) }
-            } else {
-                dot_i8_scalar(w, xt)
-            };
-            #[cfg(not(target_arch = "x86_64"))]
-            let dot = {
-                let _ = simd;
-                dot_i8_scalar(w, xt)
-            };
-            out_t[row * tokens + t] = dot * scale;
+            if simd {
+                while t + 3 <= last {
+                    // SAFETY: feature-checked; every slice is in_features long.
+                    let [a, b, c] = unsafe { dot3_f32_avx2(&widened, token(t), token(t + 1), token(t + 2)) };
+                    out_t[row * tokens + t] = a * scale;
+                    out_t[row * tokens + t + 1] = b * scale;
+                    out_t[row * tokens + t + 2] = c * scale;
+                    t += 3;
+                }
+            }
+            while t < last {
+                out_t[row * tokens + t] = dot_f32(simd, &widened, token(t)) * scale;
+                t += 1;
+            }
         }
     }
+}
+
+/// Activations per token block in [`matmul_i8_auto`]: comfortably inside a
+/// per-core L2 (1.25 MB on Alder Lake P-cores, 2 MB on the cloud Xeon).
+const TOKEN_BLOCK_BYTES: usize = 256 * 1024;
+
+/// One int8 row against one vector, through AVX2 when `simd` says it is live.
+fn dot_i8(simd: bool, w: &[i8], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        // SAFETY: the caller feature-checked AVX2 and FMA; lengths match.
+        return unsafe { dot_i8_avx2(w, x) };
+    }
+    let _ = simd;
+    dot_i8_scalar(w, x)
+}
+
+/// An already-widened row against one vector. Same lane layout, same chain
+/// assignment and same tail order as [`dot_i8_avx2`] / [`dot_i8_scalar`], so
+/// on exactly-widened weights it returns the same bits.
+fn dot_f32(simd: bool, w: &[f32], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        // SAFETY: the caller feature-checked AVX2 and FMA; lengths match.
+        return unsafe { dot_f32_avx2(w, x) };
+    }
+    let _ = simd;
+    let mut sum = 0.0f32;
+    for i in 0..x.len() {
+        sum += w[i] * x[i];
+    }
+    sum
+}
+
+/// [`dot_f32_avx2`] for three activation vectors at once, sharing each
+/// weight load. Every token keeps its own four chains, fed in the same order
+/// and combined the same way, so each result is bitwise what
+/// [`dot_f32_avx2`] returns for that token alone.
+///
+/// # Safety
+/// AVX2 and FMA must be available, and every slice the same length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot3_f32_avx2(w: &[f32], x0: &[f32], x1: &[f32], x2: &[f32]) -> [f32; 3] {
+    use std::arch::x86_64::*;
+
+    let in_features = w.len();
+    let w = w.as_ptr();
+    let xs = [x0.as_ptr(), x1.as_ptr(), x2.as_ptr()];
+
+    // acc[token][chain]: 12 registers, plus one weight and one activation.
+    let mut acc = [[_mm256_setzero_ps(); 4]; 3];
+
+    let wide = in_features / 32 * 32;
+    let mut offset = 0;
+    while offset < wide {
+        for chain in 0..4 {
+            let at = offset + 8 * chain;
+            let weights = _mm256_loadu_ps(w.add(at));
+            for token in 0..3 {
+                let activations = _mm256_loadu_ps(xs[token].add(at));
+                acc[token][chain] = _mm256_fmadd_ps(weights, activations, acc[token][chain]);
+            }
+        }
+        offset += 32;
+    }
+
+    let tail = in_features / 8 * 8;
+    while offset < tail {
+        let weights = _mm256_loadu_ps(w.add(offset));
+        for token in 0..3 {
+            acc[token][0] = _mm256_fmadd_ps(weights, _mm256_loadu_ps(xs[token].add(offset)), acc[token][0]);
+        }
+        offset += 8;
+    }
+
+    let mut out = [0.0f32; 3];
+    for token in 0..3 {
+        let [a0, a1, a2, a3] = acc[token];
+        let sum8 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let high = _mm256_extractf128_ps(sum8, 1);
+        let low = _mm256_castps256_ps128(sum8);
+        let mut sum128 = _mm_add_ps(low, high);
+        sum128 = _mm_hadd_ps(sum128, sum128);
+        sum128 = _mm_hadd_ps(sum128, sum128);
+        let mut sum = _mm_cvtss_f32(sum128);
+        for i in tail..in_features {
+            sum += *w.add(i) * *xs[token].add(i);
+        }
+        out[token] = sum;
+    }
+    out
+}
+
+/// # Safety
+/// AVX2 and FMA must be available, and `w.len() == x.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_f32_avx2(w: &[f32], x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let in_features = x.len();
+    let w = w.as_ptr();
+    let x = x.as_ptr();
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    let wide = in_features / 32 * 32;
+    let mut offset = 0;
+    while offset < wide {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(w.add(offset)), _mm256_loadu_ps(x.add(offset)), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(w.add(offset + 8)), _mm256_loadu_ps(x.add(offset + 8)), acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(w.add(offset + 16)), _mm256_loadu_ps(x.add(offset + 16)), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(w.add(offset + 24)), _mm256_loadu_ps(x.add(offset + 24)), acc3);
+        offset += 32;
+    }
+
+    let tail = in_features / 8 * 8;
+    while offset < tail {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(w.add(offset)), _mm256_loadu_ps(x.add(offset)), acc0);
+        offset += 8;
+    }
+
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let high = _mm256_extractf128_ps(acc, 1);
+    let low = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(low, high);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut sum = _mm_cvtss_f32(sum128);
+
+    for i in tail..in_features {
+        sum += *w.add(i) * *x.add(i);
+    }
+    sum
 }
 
 /// [`matmul_i8_auto`] split across the pool by blocks of output rows.

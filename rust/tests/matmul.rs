@@ -16,7 +16,9 @@ fn case(out_features: usize, in_features: usize, tokens: usize) -> (Vec<i8>, Vec
 #[test]
 fn a_batch_is_bitwise_a_loop_of_matvecs() {
     for &(out_features, in_features, tokens) in
-        &[(4, 8, 1), (7, 33, 3), (128, 896, 5), (4864, 896, 9), (896, 4864, 2)]
+        // (896, 4864, 30) crosses token blocks: 13 tokens of 4864 floats fill
+        // a 256 KiB block, so it runs as blocks of 13, 13 and 4.
+        &[(4, 8, 1), (7, 33, 3), (128, 896, 5), (4864, 896, 9), (896, 4864, 2), (896, 4864, 30), (3, 70000, 2)]
     {
         let (quantized, scales, x) = case(out_features, in_features, tokens);
 
