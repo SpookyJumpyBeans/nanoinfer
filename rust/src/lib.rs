@@ -272,6 +272,179 @@ fn dot_i8_scalar(w: &[i8], x: &[f32]) -> f32 {
     sum
 }
 
+// -- AVX-VNNI ---------------------------------------------------------------
+//
+// The AVX2 kernel above reads a quarter of the bytes and then throws most of
+// that advantage away: every eight int8 weights are sign-extended to i32,
+// converted to f32, and multiplied against f32 activations. On the real model
+// that kernel runs at about 6.4 GB/s where the machine can do ~24, so it is
+// compute-bound on the conversion rather than waiting for memory -- which is
+// how llama.cpp's Q8_0 beats it while pinned to a single thread.
+//
+// VPDPBUSD takes thirty-two bytes per instruction and accumulates into i32,
+// with no conversion in the inner loop at all. It needs both operands as
+// bytes, so the activations are quantized too; that is a real loss of
+// precision, 8 bits where there were 32, and the reason this is a separate
+// entry point rather than a silent replacement.
+//
+// The instruction multiplies *unsigned* bytes by *signed* bytes. Two ways to
+// satisfy that, and only one is cheap: make the weights unsigned, not the
+// activations. XOR with 0x80 reinterprets i8 as u8 in order, which adds 128
+// to every weight, so
+//
+//     dpbusd(w ^ 0x80, xq) = sum (w + 128) * xq
+//                          = sum (w * xq) + 128 * sum xq
+//
+// and the correction is a single scalar per call, because the activation
+// vector is shared by every row. Had the activations been offset instead, the
+// correction would have been 128 * sum(w) -- a different value per row, and a
+// second pass over the weights to compute it.
+
+/// Quantize an activation vector to symmetric int8, returning its scale.
+///
+/// One scale for the whole vector rather than per anything: the vector is a
+/// single row of activations and the kernel multiplies all of it by the same
+/// weights. An all-zero vector would divide by zero, so its scale is 1 and it
+/// reconstructs as zeros either way.
+pub fn quantize_activations_i8(x: &[f32]) -> (Vec<i8>, f32) {
+    let magnitude = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let scale = if magnitude == 0.0 { 1.0 } else { magnitude / 127.0 };
+    let mut out = vec![0i8; x.len()];
+    for i in 0..x.len() {
+        out[i] = (x[i] / scale).round().clamp(-127.0, 127.0) as i8;
+    }
+    (out, scale)
+}
+
+/// Whether this CPU can run the VNNI kernel.
+pub fn vnni_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("avxvnni")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// int8 matvec with int8 activations, through VPDPBUSD where available.
+///
+/// Quantizes `x` internally, so the caller's interface is the same as
+/// [`matvec_i8_auto`] -- but the result is not the same, because the
+/// activations lose 24 bits on the way in. Expect agreement to about one part
+/// in a hundred, not to float32 precision, and see tests/vnni.rs for the bound
+/// this is held to.
+///
+/// Falls back to [`matvec_i8_auto`] on a CPU without VNNI, which keeps the
+/// float activations and is therefore *more* accurate, not less.
+pub fn matvec_i8_vnni(quantized: &[i8], scales: &[f32], x: &[f32], out: &mut [f32]) {
+    let in_features = x.len();
+    let out_features = out.len();
+    assert_eq!(quantized.len(), out_features * in_features, "weight shape mismatch");
+    assert_eq!(scales.len(), out_features, "expected one scale per output row");
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if vnni_available() {
+            let (xq, x_scale) = quantize_activations_i8(x);
+            // sum(xq) once, not once per row: this is the whole reason the
+            // weights carry the offset instead of the activations.
+            let correction: i32 = xq.iter().map(|v| *v as i32).sum();
+            for row in 0..out_features {
+                let start = row * in_features;
+                // SAFETY: feature-checked above; the slice bounds come from
+                // the assertions at the top of this function.
+                let raw = unsafe {
+                    dot_i8_i8_vnni(&quantized[start..start + in_features], &xq)
+                };
+                out[row] = (raw - 128 * correction) as f32 * scales[row] * x_scale;
+            }
+            return;
+        }
+    }
+    matvec_i8_auto(quantized, scales, x, out)
+}
+
+/// `sum (w ^ 0x80) * xq`, as i32. The caller subtracts `128 * sum(xq)`.
+///
+/// # Safety
+/// AVX2 and AVX-VNNI must be available, and `w.len() == xq.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "avxvnni")]
+#[inline]
+unsafe fn dot_i8_i8_vnni(w: &[i8], xq: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let in_features = w.len();
+    let wp = w.as_ptr();
+    let xp = xq.as_ptr();
+
+    // Four chains again, for the same reason as the AVX2 kernel: VPDPBUSD has
+    // a multi-cycle latency and independent accumulators let the core overlap
+    // them. Thirty-two bytes per instruction, so 128 per iteration.
+    let mut acc0 = _mm256_setzero_si256();
+    let mut acc1 = _mm256_setzero_si256();
+    let mut acc2 = _mm256_setzero_si256();
+    let mut acc3 = _mm256_setzero_si256();
+
+    // XOR with this reinterprets each signed byte as the unsigned byte 128
+    // greater, which is what VPDPBUSD's first operand has to be.
+    let sign_flip = _mm256_set1_epi8(-128i8); // 0x80
+
+    let wide = in_features / 128 * 128;
+    let mut offset = 0;
+    while offset < wide {
+        _mm_prefetch::<_MM_HINT_T0>(wp.add(offset + PREFETCH_BYTES) as *const i8);
+
+        let w0 = _mm256_xor_si256(_mm256_loadu_si256(wp.add(offset) as *const __m256i), sign_flip);
+        let w1 = _mm256_xor_si256(_mm256_loadu_si256(wp.add(offset + 32) as *const __m256i), sign_flip);
+        let w2 = _mm256_xor_si256(_mm256_loadu_si256(wp.add(offset + 64) as *const __m256i), sign_flip);
+        let w3 = _mm256_xor_si256(_mm256_loadu_si256(wp.add(offset + 96) as *const __m256i), sign_flip);
+
+        let x0 = _mm256_loadu_si256(xp.add(offset) as *const __m256i);
+        let x1 = _mm256_loadu_si256(xp.add(offset + 32) as *const __m256i);
+        let x2 = _mm256_loadu_si256(xp.add(offset + 64) as *const __m256i);
+        let x3 = _mm256_loadu_si256(xp.add(offset + 96) as *const __m256i);
+
+        acc0 = _mm256_dpbusd_avx_epi32(acc0, w0, x0);
+        acc1 = _mm256_dpbusd_avx_epi32(acc1, w1, x1);
+        acc2 = _mm256_dpbusd_avx_epi32(acc2, w2, x2);
+        acc3 = _mm256_dpbusd_avx_epi32(acc3, w3, x3);
+        offset += 128;
+    }
+
+    // Whole 32-byte vectors that did not fill a 128-byte iteration.
+    let vectors = in_features / 32 * 32;
+    while offset < vectors {
+        let wv = _mm256_xor_si256(_mm256_loadu_si256(wp.add(offset) as *const __m256i), sign_flip);
+        let xv = _mm256_loadu_si256(xp.add(offset) as *const __m256i);
+        acc0 = _mm256_dpbusd_avx_epi32(acc0, wv, xv);
+        offset += 32;
+    }
+
+    let acc = _mm256_add_epi32(
+        _mm256_add_epi32(acc0, acc1),
+        _mm256_add_epi32(acc2, acc3),
+    );
+    let high = _mm256_extracti128_si256(acc, 1);
+    let low = _mm256_castsi256_si128(acc);
+    let mut sum128 = _mm_add_epi32(low, high);
+    sum128 = _mm_hadd_epi32(sum128, sum128);
+    sum128 = _mm_hadd_epi32(sum128, sum128);
+    let mut sum = _mm_cvtsi128_si32(sum128);
+
+    // The remainder, done the same way the vector path does it -- including
+    // the 0x80 offset, so the caller's single correction still applies to the
+    // whole row. 896 and 4864 are both multiples of 32, so this is empty for
+    // this model, but a kernel that drops its tail is a trap for the next one.
+    for i in offset..in_features {
+        let unsigned = (*wp.add(i) as i32) + 128;
+        sum += unsigned * (*xp.add(i) as i32);
+    }
+    sum
+}
+
 // -- multithreading --------------------------------------------------------
 //
 use rayon::prelude::*;
