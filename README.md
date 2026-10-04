@@ -28,8 +28,8 @@ against the uncached path. [More below.](#running-it)
 | 4 | KV cache; identical output, measured speedup | **done** |
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
-| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done and wired in**, WebGPU not started |
-| 8 | Benchmark against llama.cpp on identical hardware | **done** |
+| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done, wired in, AVX-VNNI**; WebGPU measured and rejected |
+| 8 | Benchmark against llama.cpp on identical hardware | **done — and beaten, 32.45 vs 38.79 ms/token** |
 
 Each phase is verified against a reference implementation before the next one
 starts. Correctness first; a fast wrong answer teaches nothing.
@@ -465,7 +465,82 @@ finishing that would be worth. (They are now — see
 
 **llama.cpp wins prefill outright, 2–3×** (22–45 ms/token against 69–77). Prefill
 is a compute-bound matmul over the whole prompt, which is the regime where better
-kernels do pay.
+kernels do pay. (No longer true either — see below.)
+
+### AVX-VNNI, and the gap closed
+
+Every decode number above is superseded. Twelve reps, five engines alternating
+inside each rep, each at its own best thread count:
+
+| engine | threads | prefill ms/tok | decode ms/tok | decode tok/s |
+|---|---:|---:|---:|---:|
+| nanoinfer f32 | 6 | 26.07 | 72.82 | 13.73 |
+| nanoinfer int8 | 6 | 15.25 | 59.52 | 16.80 |
+| **nanoinfer int8 + VNNI** | 6 | **15.04** | **32.45** | **30.82** |
+| llama.cpp f32 | 3 | 15.73 | 80.65 | 12.40 |
+| llama.cpp Q8_0 | 1 | 14.93 | 38.79 | 25.78 |
+
+**This engine decodes faster than llama.cpp: 32.45 against 38.79 ms/token.**
+Twelve of twelve paired reps favour it, the worst by 1.06× and the best by
+1.37×, so there is no rep llama.cpp won. Three independent runs put the ratio at
+1.21×, 1.24× and 1.20× — the absolute numbers move with machine load, the ratio
+does not. Prefill is now a tie rather than a 2–3× loss.
+
+### Why the earlier kernel was leaving it on the table
+
+Profiling decode on the real model put **76.6%** of the time inside the int8
+kernel — 97 calls per token, with attention, the norms, RoPE and softmax
+together under 10%. Python was never the problem. The kernel ran at **6.4 GB/s
+against this machine's ~24**, which says compute-bound on *converting* int8 to
+float rather than waiting for memory: it widened eight bytes at a time with
+`_mm256_cvtepi8_epi32` and did the dot product in floating point.
+
+This CPU reports `avxvnni`. VPDPBUSD takes **thirty-two bytes per instruction**
+and accumulates in i32, with no conversion in the inner loop — 2.2–2.6× on the
+per-layer projections, 1.39× on the LM head, which at 136M weights is the one
+shape genuinely memory-bound rather than instruction-bound. That spread across
+shapes is the diagnosis confirming itself.
+
+It also explains how llama.cpp was winning while pinned to `-t 1`: its Q8_0
+kernels use the same instruction, so this was never a parallelism gap.
+
+The sign handling is the fiddly part. VPDPBUSD multiplies *unsigned* by
+*signed*, and the cheap way to satisfy that is to offset the weights rather than
+the activations — `XOR 0x80` reads `i8` as `u8` in order, adding 128 to each:
+
+```
+dpbusd(w ^ 0x80, xq) = Σ(w·xq) + 128·Σxq
+```
+
+so the correction is **one scalar per call**, because the activation vector is
+shared by every row. Offsetting the activations instead would have needed
+`128·Σw` — a different value per row, and a second pass over the weights to get
+it.
+
+It is **off by default**, because it is not free: VPDPBUSD needs both operands
+as bytes, so activations carry 8 bits where they carried 32. Measured at 0.83%
+relative error against the float-activation path on a real projection, where
+that path is 2e-07 from a NumPy reference. `use_vnni(True)` opts in and returns
+what took effect, so asking on a CPU without the instruction gets `False` and
+the more accurate kernel rather than a pretence.
+
+### The gate that got this wrong twice
+
+The first version of this comparison had llama.cpp 1.8–2.6× **ahead**. That was
+two numbers from different runs on different days — mine at its best against
+llama.cpp's from phase 8. Measured in one process, alternating, llama.cpp came
+in at 66 rather than 85 and the apparent margin evaporated. The same error as
+phase 4's 15× cliff, reintroduced.
+
+The fix after that was also wrong. Gating on `max/min` spread looks prudent and
+is unusable: it can only grow as reps are added, so more evidence makes a lead
+look *less* certain. Eight reps reported spreads of 1.4–2.2×; twenty reported
+4.6–8.6×. Same machine, same code.
+
+What works is the paired test. The contenders already alternate inside each rep,
+so every rep is a matched pair under shared conditions, and counting wins is a
+sign test — robust to exactly the stalls that move the absolute numbers around.
+Twelve of twelve is p ≈ 0.0002, and it did not need a quiet machine to say so.
 
 ### Handing your opponent a bad flag is not a benchmark
 
