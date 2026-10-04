@@ -223,8 +223,17 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * 82)
 
     # The comparison this tool exists for, stated only as strongly as the
-    # measurement supports it. A margin inside the spread of either contender
-    # is not a result, however much one would prefer it to be.
+    # measurement supports it.
+    #
+    # Not max/min as the gate, which was the first attempt and is unusable:
+    # it can only grow as reps are added, so more data makes a lead look less
+    # certain rather than more. Twenty reps reported spreads of 4.6-8.6x where
+    # eight reported 1.4-2.2x, on the same machine and the same code.
+    #
+    # The contenders alternate inside each rep, so each rep is a matched pair
+    # measured under the same conditions. Counting how often one wins is
+    # therefore a sign test, and it is robust to exactly the stalls that make
+    # the absolute numbers move around.
     mine = "nanoinfer vnni" if "nanoinfer vnni" in best else "nanoinfer int8"
     ours = best[mine]["decode"]
     noisiest = max(spreads[mine], spreads.get("llama.cpp Q8_0", 1.0))
@@ -235,13 +244,25 @@ def main(argv: list[str] | None = None) -> int:
         margin = theirs / ours if ours < theirs else ours / theirs
         leader = mine if ours < theirs else name
         print(f"{mine} {ours:.2f} ms/tok against {name} {theirs:.2f} ms/tok")
-        if margin < noisiest:
-            print(f"  {leader} leads by {margin:.2f}x, but the widest spread "
-                  f"seen was {noisiest:.2f}x -- inside the noise, so this is "
-                  f"NOT yet a result. Quiet the machine and raise --reps.")
+        mine_each = seen[mine]["decode"]
+        theirs_each = seen[name]["decode"]
+        pairs = list(zip(mine_each, theirs_each))
+        wins = sum(1 for a, b in pairs if a < b)
+        ratios = sorted(b / a for a, b in pairs)
+        print(f"  minima: {leader} leads by {margin:.2f}x")
+        print(f"  paired: {mine} faster in {wins}/{len(pairs)} reps, "
+              f"per-rep ratio {ratios[0]:.2f}x to {ratios[-1]:.2f}x")
+        # One-sided sign test at p < 0.05 needs every rep for n <= 5, and
+        # n - 1 of them by about n = 8. Requiring a clean sweep is stricter
+        # than that and needs no table.
+        if wins == len(pairs) and min(ratios) > 1.0:
+            print(f"  every rep agrees and the worst-case rep still favours "
+                  f"{mine} by {ratios[0]:.2f}x -- this one holds.")
+        elif wins > len(pairs) * 0.5:
+            print(f"  {mine} wins most reps but not all; the losing reps mean "
+                  f"this is suggestive, not settled.")
         else:
-            print(f"  {leader} leads by {margin:.2f}x, wider than the "
-                  f"{noisiest:.2f}x spread -- this one holds.")
+            print(f"  {name} wins most reps -- no claim for {mine} here.")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("a", encoding="utf-8") as fh:
