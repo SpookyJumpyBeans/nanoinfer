@@ -17,3 +17,4 @@ dist/
 bench/*.tmp
 scratch/
 rust/target/
+gpu/target/
