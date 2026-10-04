@@ -187,11 +187,14 @@ def test_stored_model_keeps_the_integers(tiny_weights):
     # Norms and biases are still float32 arrays, shared with the source.
     assert layer.q_proj_bias is source.q_proj_bias
     assert layer.input_layernorm is source.input_layernorm
-    # The footprint the report promises is the footprint actually held.
+    # The footprint the report promises is the footprint actually held. The
+    # embedding matrix counts toward it: it is quantized by default now, and it
+    # is the largest single tensor, so omitting it from this sum would let the
+    # report disagree with reality by more than all the layers together.
     assert stored.nbytes < tiny_weights.nbytes
     assert report.quantized_bytes == sum(
         getattr(l, f).nbytes for l in stored.layers for f in LINEAR_FIELDS
-    )
+    ) + stored.embed_tokens.nbytes
 
 
 def test_int4_cannot_be_stored(tiny_weights):
