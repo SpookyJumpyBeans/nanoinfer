@@ -922,3 +922,87 @@ pub unsafe extern "C" fn nanoinfer_matmul_i8(
     let out_t = std::slice::from_raw_parts_mut(out_t, out_features * tokens);
     matmul_i8_parallel(quantized, scales, x, tokens, out_t);
 }
+
+/// int8 weights times `tokens` activation vectors, through VPDPBUSD.
+///
+/// Same shapes as [`matmul_i8_auto`] -- `x` row-major `[tokens, in_features]`,
+/// `out_t` row-major `[out_features, tokens]` -- and a different answer, by
+/// about one part in a hundred: the activations are quantized to int8 so the
+/// instruction can take them. Each token gets its own scale, so a long prompt
+/// does not share one token's dynamic range with the rest.
+///
+/// Falls back to [`matmul_i8_auto`] without VNNI, which keeps f32 activations.
+pub fn matmul_i8_vnni(
+    quantized: &[i8],
+    scales: &[f32],
+    x: &[f32],
+    tokens: usize,
+    out_t: &mut [f32],
+) {
+    let out_features = scales.len();
+    assert!(tokens > 0, "expected at least one token");
+    assert_eq!(x.len() % tokens, 0, "activation shape mismatch");
+    let in_features = x.len() / tokens;
+    assert_eq!(quantized.len(), out_features * in_features, "weight shape mismatch");
+    assert_eq!(out_t.len(), out_features * tokens, "output shape mismatch");
+
+    if !vnni_available() {
+        return matmul_i8_auto(quantized, scales, x, tokens, out_t);
+    }
+
+    // Quantize every token once, before touching the weights. Each token's
+    // own scale and its own sum(xq) correction, both reused across all rows.
+    let mut xq = vec![0i8; x.len()];
+    let mut x_scales = vec![0.0f32; tokens];
+    let mut corrections = vec![0i32; tokens];
+    for t in 0..tokens {
+        let row = &x[t * in_features..(t + 1) * in_features];
+        let (q, scale) = quantize_activations_i8(row);
+        corrections[t] = q.iter().map(|v| *v as i32).sum();
+        x_scales[t] = scale;
+        xq[t * in_features..(t + 1) * in_features].copy_from_slice(&q);
+    }
+
+    // Weights outermost: each row is read once and dotted against every
+    // token, which is the access pattern the f32 path uses for the same
+    // reason -- the weights are what streams from DRAM, not the activations.
+    for row in 0..out_features {
+        let w = &quantized[row * in_features..(row + 1) * in_features];
+        let weight_scale = scales[row];
+        for t in 0..tokens {
+            let activations = &xq[t * in_features..(t + 1) * in_features];
+            // SAFETY: vnni_available() checked above; lengths match by the
+            // assertions at the top and the slicing here.
+            let raw = unsafe { dot_i8_i8_vnni(w, activations) };
+            out_t[row * tokens + t] =
+                (raw - 128 * corrections[t]) as f32 * weight_scale * x_scales[t];
+        }
+    }
+}
+
+/// Whether the VNNI kernel is live, for Python to report.
+#[no_mangle]
+pub extern "C" fn nanoinfer_has_vnni() -> i32 {
+    i32::from(vnni_available())
+}
+
+/// VNNI batch matmul over the C ABI; see [`nanoinfer_matmul_i8`] for shapes.
+///
+/// # Safety
+/// As [`nanoinfer_matmul_i8`].
+#[no_mangle]
+pub unsafe extern "C" fn nanoinfer_matmul_i8_vnni(
+    quantized: *const i8,
+    scales: *const f32,
+    x: *const f32,
+    out_t: *mut f32,
+    out_features: usize,
+    in_features: usize,
+    tokens: usize,
+) {
+    let quantized = std::slice::from_raw_parts(quantized, out_features * in_features);
+    let scales = std::slice::from_raw_parts(scales, out_features);
+    let x = std::slice::from_raw_parts(x, tokens * in_features);
+    let out_t = std::slice::from_raw_parts_mut(out_t, out_features * tokens);
+    matmul_i8_vnni(quantized, scales, x, tokens, out_t);
+}

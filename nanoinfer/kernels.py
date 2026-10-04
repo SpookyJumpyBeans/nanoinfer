@@ -76,11 +76,15 @@ def _load() -> ctypes.CDLL | None:
         # typed pointers. Building a POINTER object per array with data_as()
         # was ~40% of an otherwise empty call -- 169 calls a token, ~3 ms --
         # and the typing it buys is already enforced by _as_kernel_input.
-        library.nanoinfer_matmul_i8.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 3
-        library.nanoinfer_matmul_i8.restype = None
+        for symbol in ("nanoinfer_matmul_i8", "nanoinfer_matmul_i8_vnni"):
+            function = getattr(library, symbol)
+            function.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 3
+            function.restype = None
 
         library.nanoinfer_has_avx2.argtypes = []
         library.nanoinfer_has_avx2.restype = ctypes.c_int
+        library.nanoinfer_has_vnni.argtypes = []
+        library.nanoinfer_has_vnni.restype = ctypes.c_int
         library.nanoinfer_num_threads.argtypes = []
         library.nanoinfer_num_threads.restype = ctypes.c_int
         return library
@@ -211,7 +215,12 @@ def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.nd
     # Rust writes [out_features, tokens] so that each worker's rows are one
     # contiguous block; the transpose back is a view, not a copy.
     out_t = np.empty((out_features, tokens), dtype=np.float32)
-    _LIBRARY.nanoinfer_matmul_i8(
+    entry = (
+        _LIBRARY.nanoinfer_matmul_i8_vnni
+        if _USE_VNNI
+        else _LIBRARY.nanoinfer_matmul_i8
+    )
+    entry(
         quantized.ctypes.data,
         scales.ctypes.data,
         x.ctypes.data,
@@ -221,6 +230,32 @@ def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.nd
         tokens,
     )
     return out_t.T
+
+
+# Off by default, and deliberately not a silent upgrade. The VNNI kernel
+# quantizes activations to int8 so VPDPBUSD can take them, which costs about
+# one part in a hundred against the float-activation path. Leaving it off keeps
+# the engine bit-comparable with the simulated quantization the perplexity
+# numbers were measured on; this is opted into for timing, and for use once
+# that quality cost has been measured end to end rather than assumed.
+_USE_VNNI = False
+
+
+def vnni_available() -> bool:
+    """Whether the loaded library can run the VNNI kernel on this CPU."""
+    return _LIBRARY is not None and bool(_LIBRARY.nanoinfer_has_vnni())
+
+
+def use_vnni(enabled: bool) -> bool:
+    """Route :func:`matmul_i8` through the VNNI kernel; returns what took effect.
+
+    Asking for it on a CPU without AVX-VNNI leaves it off rather than
+    pretending: the caller gets ``False`` back and keeps the float-activation
+    kernel, which is the more accurate of the two.
+    """
+    global _USE_VNNI
+    _USE_VNNI = bool(enabled) and vnni_available()
+    return _USE_VNNI
 
 
 def matvec_i8_numpy(
