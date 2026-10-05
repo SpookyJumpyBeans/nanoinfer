@@ -29,7 +29,7 @@ against the uncached path. [More below.](#running-it)
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
 | 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done, wired in, AVX-VNNI**; WebGPU measured and rejected |
-| 8 | Benchmark against llama.cpp on identical hardware | **done** — faster (32.45 vs 38.79 ms/tok) at 3.5× the quality cost |
+| 8 | Benchmark against llama.cpp on identical hardware | **done** — quality tied (+0.85% vs +0.87%), decode leads 1.2–1.4× |
 
 Each phase is verified against a reference implementation before the next one
 starts. Correctness first; a fast wrong answer teaches nothing.
@@ -480,36 +480,82 @@ inside each rep, each at its own best thread count:
 | llama.cpp f32 | 3 | 15.73 | 80.65 | 12.40 |
 | llama.cpp Q8_0 | 1 | 14.93 | 38.79 | 25.78 |
 
-**This engine decodes faster than llama.cpp — 32.45 against 38.79 ms/token —
-and pays 3.5× more quality to do it.** The speed is solid: twelve of twelve
-paired reps favour it, the worst by 1.06× and the best by 1.37×, so there is no
-rep llama.cpp won, and three independent runs put the ratio at 1.21×, 1.24× and
-1.20×. Prefill is now a tie rather than a 2–3× loss.
+That run used **one activation scale per row**, which is fast and costs more
+quality than llama.cpp pays. The version in the tree now uses **one scale per
+32 values**, which ties on quality. The two claims are therefore measured on
+different configurations, and they are reported separately rather than merged
+into one flattering sentence.
 
-The quality is where it loses. Perplexity on 512 held-out tokens, each engine
-against **its own** f32 baseline, since the two harnesses disagree on absolutes:
+**Quality is a tie, and this part is settled.** Perplexity on 512 held-out
+tokens, each engine against **its own** f32 baseline since the two harnesses
+disagree on absolutes. Perplexity is deterministic, so unlike the timings these
+figures do not move with machine load:
 
 | | f32 | int8 | cost |
 |---|---:|---:|---:|
 | llama.cpp Q8_0 | 17.9717 | 18.1280 | **+0.87%** |
 | nanoinfer int8, f32 activations | 23.2690 | 23.3133 | +0.19% |
-| nanoinfer int8 + VNNI | 23.2690 | 23.9746 | **+3.03%** |
+| nanoinfer int8 + VNNI, one scale per row | 23.2690 | 23.9746 | +3.03% |
+| **nanoinfer int8 + VNNI, scale per 32** | 23.2690 | 23.4670 | **+0.85%** |
 
-So the honest statement is not "faster than llama.cpp" but *faster at a worse
-operating point*: 1.20× the speed for 3.5× the perplexity cost. Greedy decoding
-diverges from the float-activation path at token 8 of 32.
+0.85% against 0.87%, where llama.cpp's own estimate carries ±1.19 on 18.13 —
+about ±6.6%. Nothing that close is a quality win for either side, so this is a
+tie, not a victory.
 
-The cause is almost certainly scale granularity, and it is phase 6's
-per-tensor-versus-per-channel argument arriving on the activation side. This
-kernel uses **one scale per 896-value activation row**; llama.cpp's Q8_0 and
-Q8_1 use **one scale per 32-value block**. A single outlier in a row flattens
-the resolution of everything beside it, which is exactly what per-channel
-weight scales were introduced to avoid. Block-wise activation scales are the
-obvious next move and would cost one float per 32 values — about 3% overhead on
-the activations, against recovering most of 2.84%.
+**Speed leads, but is not yet nailed down at the tied-quality setting.** The
+12-of-12 sweep above was the per-row kernel. The blocked kernel has only been
+timed on a laptop by then several hours into continuous benchmarking, where it
+led by 1.37× on minima and won 10 of 12 paired reps. That run is visibly
+throttled: every engine was about twice as slow as the clean run, llama.cpp
+included, on llama.cpp code that had not changed —
 
-Until that is done, VNNI is a speed/quality trade rather than a win, which is
-why it stays off by default.
+| | clean run | throttled run |
+|---|---:|---:|
+| nanoinfer f32 | 72.82 | 130.12 |
+| llama.cpp Q8_0 | 38.79 | 93.61 |
+
+— so the relative picture is readable and the absolute numbers are not. What is
+outstanding is one clean run at block 32 to confirm the sweep holds at tied
+quality:
+
+```sh
+OPENBLAS_NUM_THREADS=6 python -m tools.bench_llamacpp --llama-cpp ../llama.cpp --reps 12
+```
+
+### Why one scale per row was the wrong granularity
+
+It is phase 6's per-tensor-versus-per-channel argument arriving on the
+activation side, at worse granularity than the case that argument was first
+made about. Measured on the real model, one decode step's activations:
+
+| width | max/median \|x\| | per-row error | per-32 error |
+|---:|---:|---:|---:|
+| 896 | 28.9× | 2.53% | 0.96% |
+| 4864 | **68.3×** | 4.97% | 0.90% |
+
+The largest element in a 4864-wide activation vector is 68× the median, so a
+per-row scale is set by that one value and the other 4863 share a range 68×
+too wide. Blocking confines each outlier to its own 32 values. The perplexity
+curve flattens there — one per 128 costs +1.37%, one per 32 costs +0.85%, one
+per 16 also +0.85% — which is presumably why llama.cpp's Q8_0 and Q8_1 both use
+32. Overhead is one f32 per 32 bytes of activation, and activations are not what
+streams from DRAM.
+
+### Two things that were worth more than the kernel
+
+The first blocked version was *slower* than the per-row kernel it replaced, and
+neither cause was the arithmetic.
+
+**It allocated three `Vec`s per call.** The blocked matmul runs 97 times per
+decoded token, so that was ~300 allocations a token, and it showed as a 4.37×
+spread. Activations are now quantized once into flat buffers.
+
+**Both VNNI matmuls were single-threaded.** The float-activation path they were
+measured against uses rayon. So every VNNI number recorded before that fix —
+32.45 ms/token, the 2.2–2.6× per-shape gains, the 12-of-12 sweep — was **one
+core against six**, which makes the instruction-level win larger than it looked
+rather than smaller. Rows are independent, so they now split the way
+`matmul_i8_parallel` splits them.
 
 ### Why the earlier kernel was leaving it on the table
 
@@ -543,9 +589,9 @@ shared by every row. Offsetting the activations instead would have needed
 it.
 
 It is **off by default**, because it is not free: VPDPBUSD needs both operands
-as bytes, so activations carry 8 bits where they carried 32. Measured at 0.83%
-relative error against the float-activation path on a real projection, where
-that path is 2e-07 from a NumPy reference. `use_vnni(True)` opts in and returns
+as bytes, so activations carry 8 bits where they carried 32 — +0.85%
+perplexity against an fp32 baseline, where the float-activation path costs
++0.19%. `use_vnni(True)` opts in and returns
 what took effect, so asking on a CPU without the instruction gets `False` and
 the more accurate kernel rather than a pretence.
 
