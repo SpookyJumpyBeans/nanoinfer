@@ -80,6 +80,10 @@ def _load() -> ctypes.CDLL | None:
             function = getattr(library, symbol)
             function.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 3
             function.restype = None
+        library.nanoinfer_matmul_i8_vnni_blocked.argtypes = (
+            [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 4
+        )
+        library.nanoinfer_matmul_i8_vnni_blocked.restype = None
 
         library.nanoinfer_has_avx2.argtypes = []
         library.nanoinfer_has_avx2.restype = ctypes.c_int
@@ -215,6 +219,19 @@ def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.nd
     # Rust writes [out_features, tokens] so that each worker's rows are one
     # contiguous block; the transpose back is a view, not a copy.
     out_t = np.empty((out_features, tokens), dtype=np.float32)
+    if _USE_VNNI and _VNNI_BLOCK:
+        _LIBRARY.nanoinfer_matmul_i8_vnni_blocked(
+            quantized.ctypes.data,
+            scales.ctypes.data,
+            x.ctypes.data,
+            out_t.ctypes.data,
+            out_features,
+            in_features,
+            tokens,
+            _VNNI_BLOCK,
+        )
+        return out_t.T
+
     entry = (
         _LIBRARY.nanoinfer_matmul_i8_vnni
         if _USE_VNNI
@@ -240,10 +257,30 @@ def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.nd
 # that quality cost has been measured end to end rather than assumed.
 _USE_VNNI = False
 
+# Activation values per scale. 32 is what llama.cpp's Q8_0 and Q8_1 use, and
+# where this model's error stops improving: one scale per row costs +5.42%
+# perplexity against an fp32 baseline, per 128 costs +1.37%, per 32 costs
+# +0.46%, and per 16 measured no better than per 32. Zero means one scale for
+# the whole row, which is what the first VNNI kernel did.
+_VNNI_BLOCK = 32
+
 
 def vnni_available() -> bool:
     """Whether the loaded library can run the VNNI kernel on this CPU."""
     return _LIBRARY is not None and bool(_LIBRARY.nanoinfer_has_vnni())
+
+
+def vnni_block(values_per_scale: int) -> int:
+    """Set how many activation values share a scale; returns what took effect.
+
+    Zero or a value at least as wide as a row gives one scale per row, which is
+    measurably worse on this model: these activations run to 28.9x the median on
+    the 896-wide inputs and 68.3x on the 4864-wide ones, so a single scale is
+    set by the outlier and crushes everything beside it.
+    """
+    global _VNNI_BLOCK
+    _VNNI_BLOCK = max(int(values_per_scale), 0)
+    return _VNNI_BLOCK
 
 
 def use_vnni(enabled: bool) -> bool:

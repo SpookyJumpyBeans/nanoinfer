@@ -966,18 +966,41 @@ pub fn matmul_i8_vnni(
     // Weights outermost: each row is read once and dotted against every
     // token, which is the access pattern the f32 path uses for the same
     // reason -- the weights are what streams from DRAM, not the activations.
-    for row in 0..out_features {
-        let w = &quantized[row * in_features..(row + 1) * in_features];
-        let weight_scale = scales[row];
-        for t in 0..tokens {
-            let activations = &xq[t * in_features..(t + 1) * in_features];
-            // SAFETY: vnni_available() checked above; lengths match by the
-            // assertions at the top and the slicing here.
-            let raw = unsafe { dot_i8_i8_vnni(w, activations) };
-            out_t[row * tokens + t] =
-                (raw - 128 * corrections[t]) as f32 * weight_scale * x_scales[t];
+    // Rows are independent, so they split across threads with no
+    // synchronisation, as in matmul_i8_parallel.
+    let rows = |weights: &[i8], row_scales: &[f32], chunk: &mut [f32]| {
+        for (row, row_scale) in row_scales.iter().enumerate() {
+            let w = &weights[row * in_features..(row + 1) * in_features];
+            for t in 0..tokens {
+                let activations = &xq[t * in_features..(t + 1) * in_features];
+                // SAFETY: vnni_available() checked above; lengths match by the
+                // assertions at the top and the slicing here.
+                let raw = unsafe { dot_i8_i8_vnni(w, activations) };
+                chunk[row * tokens + t] =
+                    (raw - 128 * corrections[t]) as f32 * row_scale * x_scales[t];
+            }
         }
+    };
+
+    let threads = rayon::current_num_threads();
+    if threads <= 1 || out_features < threads * 8 {
+        rows(quantized, scales, out_t);
+        return;
     }
+
+    let rows_per_thread = out_features.div_ceil(threads);
+    out_t
+        .par_chunks_mut(rows_per_thread * tokens)
+        .enumerate()
+        .for_each(|(block_index, chunk)| {
+            let row_start = block_index * rows_per_thread;
+            let count = chunk.len() / tokens;
+            rows(
+                &quantized[row_start * in_features..(row_start + count) * in_features],
+                &scales[row_start..row_start + count],
+                chunk,
+            );
+        });
 }
 
 /// Whether the VNNI kernel is live, for Python to report.
@@ -1005,4 +1028,321 @@ pub unsafe extern "C" fn nanoinfer_matmul_i8_vnni(
     let x = std::slice::from_raw_parts(x, tokens * in_features);
     let out_t = std::slice::from_raw_parts_mut(out_t, out_features * tokens);
     matmul_i8_vnni(quantized, scales, x, tokens, out_t);
+}
+
+// -- block-wise activation scales ------------------------------------------
+//
+// One scale per activation row is set by that row's largest element, and these
+// activations are outlier-heavy: 28.9x the median on the 896-wide inputs and
+// 68.3x on the 4864-wide ones, measured on the real model. The other 895 or
+// 4863 values then share a range sized for the outlier, which is phase 6's
+// per-tensor-versus-per-channel failure happening on the activation side.
+//
+// Blocking confines each outlier to its own 32 values. Simulated in Python
+// before any of this was written, the cost against an fp32 baseline went from
+// +5.42% to +0.46%, where llama.cpp's Q8_0 costs +0.87% -- so this is the
+// change that makes the engine both faster and more accurate than llama.cpp
+// rather than faster and worse.
+//
+// The arithmetic has to avoid a horizontal sum per block, which would give
+// back the speed. With one scale per block the i32 accumulators cannot simply
+// run to the end of the row, so instead each block's i32 lanes are converted
+// to f32 and fused-multiply-added by that block's scale into an f32
+// accumulator, and the 0x80 correction is factored out:
+//
+//     acc = sum_b (block_dot_b + 128 * block_sum_b) * x_scale_b
+//     row = w_scale * (acc - 128 * sum_b block_sum_b * x_scale_b)
+//
+// The subtracted term depends only on the activations, not on the weight row,
+// so it is computed once per call and reused for every row. One horizontal sum
+// per row, as before, rather than one per block.
+
+/// Quantize activations to int8 with one scale per `block` values.
+///
+/// Returns the bytes, one scale per block, and `128 * sum_b(block_sum_b *
+/// scale_b)` -- the offset term the kernel subtracts, precomputed here because
+/// it is the same for every weight row.
+pub fn quantize_activations_blocked(x: &[f32], block: usize) -> (Vec<i8>, Vec<f32>, f32) {
+    assert!(block > 0, "block size must be positive");
+    let blocks = x.len().div_ceil(block);
+    let mut values = vec![0i8; x.len()];
+    let mut scales = vec![0.0f32; blocks];
+    let mut offset = 0.0f32;
+
+    for b in 0..blocks {
+        let start = b * block;
+        let end = (start + block).min(x.len());
+        let group = &x[start..end];
+
+        let magnitude = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let scale = if magnitude == 0.0 { 1.0 } else { magnitude / 127.0 };
+        scales[b] = scale;
+
+        let mut block_sum = 0i32;
+        for i in start..end {
+            let q = (x[i] / scale).round().clamp(-127.0, 127.0) as i8;
+            values[i] = q;
+            block_sum += q as i32;
+        }
+        offset += block_sum as f32 * scale;
+    }
+
+    (values, scales, 128.0 * offset)
+}
+
+/// [`quantize_activations_blocked`] writing into caller-owned slices.
+///
+/// Same arithmetic; it exists so a batch can quantize every token into one
+/// flat pair of buffers rather than allocating a Vec per token. The blocked
+/// matmul ran 97 times per decoded token, so allocating three Vecs per call
+/// was ~300 allocations a token and showed up as a 4.37x spread.
+pub fn quantize_activations_blocked_into(
+    x: &[f32],
+    block: usize,
+    values: &mut [i8],
+    scales: &mut [f32],
+) -> f32 {
+    assert!(block > 0, "block size must be positive");
+    assert_eq!(values.len(), x.len(), "value buffer must match the input");
+    let blocks = x.len().div_ceil(block);
+    assert!(scales.len() >= blocks, "scale buffer too small");
+
+    let mut offset = 0.0f32;
+    for b in 0..blocks {
+        let start = b * block;
+        let end = (start + block).min(x.len());
+
+        let magnitude = x[start..end].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let scale = if magnitude == 0.0 { 1.0 } else { magnitude / 127.0 };
+        scales[b] = scale;
+
+        let mut block_sum = 0i32;
+        for i in start..end {
+            let q = (x[i] / scale).round().clamp(-127.0, 127.0) as i8;
+            values[i] = q;
+            block_sum += q as i32;
+        }
+        offset += block_sum as f32 * scale;
+    }
+    128.0 * offset
+}
+
+/// int8 matvec with block-wise int8 activations, through VPDPBUSD.
+///
+/// `block` is the number of activation values sharing a scale; 32 is the size
+/// llama.cpp's Q8_0 and Q8_1 use, and the size where this model's error stops
+/// improving -- 16 measured no better than 32.
+///
+/// Falls back to [`matvec_i8_auto`] without VNNI.
+pub fn matvec_i8_vnni_blocked(
+    quantized: &[i8],
+    scales: &[f32],
+    x: &[f32],
+    block: usize,
+    out: &mut [f32],
+) {
+    let in_features = x.len();
+    let out_features = out.len();
+    assert_eq!(quantized.len(), out_features * in_features, "weight shape mismatch");
+    assert_eq!(scales.len(), out_features, "expected one scale per output row");
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if vnni_available() {
+            let (xq, x_scales, offset) = quantize_activations_blocked(x, block);
+            for row in 0..out_features {
+                let start = row * in_features;
+                // SAFETY: feature-checked above; lengths come from the
+                // assertions and the slicing here.
+                let acc = unsafe {
+                    dot_i8_blocked_vnni(
+                        &quantized[start..start + in_features],
+                        &xq,
+                        &x_scales,
+                        block,
+                    )
+                };
+                out[row] = (acc - offset) * scales[row];
+            }
+            return;
+        }
+    }
+    let _ = block;
+    matvec_i8_auto(quantized, scales, x, out)
+}
+
+/// `sum_b (block_dot_b + 128 * block_sum_b) * scale_b`, as f32.
+///
+/// The caller subtracts the precomputed offset and multiplies by the row's
+/// weight scale.
+///
+/// # Safety
+/// AVX2, FMA and AVX-VNNI must be available; `w.len() == xq.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma", enable = "avxvnni")]
+#[inline]
+unsafe fn dot_i8_blocked_vnni(w: &[i8], xq: &[i8], x_scales: &[f32], block: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let in_features = w.len();
+    let wp = w.as_ptr();
+    let xp = xq.as_ptr();
+    let sign_flip = _mm256_set1_epi8(-128i8); // 0x80
+
+    let mut acc = _mm256_setzero_ps();
+    let mut offset = 0;
+
+    // Whole 32-byte groups. One dpbusd, one convert, one fmadd each: three
+    // instructions more per 32 bytes than the per-row kernel, against the
+    // eight-at-a-time float widening this replaced.
+    while offset + 32 <= in_features && block >= 32 {
+        _mm_prefetch::<_MM_HINT_T0>(wp.add(offset + PREFETCH_BYTES) as *const i8);
+
+        let wv = _mm256_xor_si256(
+            _mm256_loadu_si256(wp.add(offset) as *const __m256i),
+            sign_flip,
+        );
+        let xv = _mm256_loadu_si256(xp.add(offset) as *const __m256i);
+        let products = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wv, xv);
+
+        // The block index comes from the offset, not from a running counter
+        // scaled by the block size. Incrementing by a ratio was wrong for any
+        // block wider than 32: with block = 128 it walked a one-element scale
+        // array four times over and read whatever followed it.
+        let b = offset / block;
+        debug_assert!(b < x_scales.len(), "block index past the scale array");
+        let scale = _mm256_set1_ps(*x_scales.get_unchecked(b));
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(products), scale, acc);
+
+        offset += 32;
+    }
+
+    let high = _mm256_extractf128_ps(acc, 1);
+    let low = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(low, high);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut total = _mm_cvtss_f32(sum128);
+
+    // Whatever is left: a block narrower than 32, or a ragged tail. Same
+    // arithmetic in scalar form, including the 0x80 offset, so the caller's
+    // precomputed correction still covers the whole row.
+    while offset < in_features {
+        let b_index = offset / block;
+        let scale = *x_scales.get_unchecked(b_index);
+        let end = (offset + block.min(in_features - offset)).min(in_features);
+        let mut partial = 0i32;
+        for i in offset..end {
+            let unsigned = (*wp.add(i) as i32) + 128;
+            partial += unsigned * (*xp.add(i) as i32);
+        }
+        total += partial as f32 * scale;
+        offset = end;
+    }
+    total
+}
+
+/// int8 weights times `tokens` activation vectors, block-wise through VPDPBUSD.
+///
+/// Shapes as [`matmul_i8_auto`]. Activations are quantized once, up front, into
+/// flat buffers shared read-only by every worker; the rows are then split
+/// across threads the way [`matmul_i8_parallel`] splits them, since a row is
+/// computed entirely by one thread and needs no synchronisation.
+///
+/// Both of those were missing from the first version, and together they were
+/// worth more than the kernel: it allocated three Vecs per call and ran the row
+/// loop on one core while the float-activation path it was being compared
+/// against used all of them.
+pub fn matmul_i8_vnni_blocked(
+    quantized: &[i8],
+    scales: &[f32],
+    x: &[f32],
+    tokens: usize,
+    block: usize,
+    out_t: &mut [f32],
+) {
+    let out_features = scales.len();
+    assert!(tokens > 0, "expected at least one token");
+    assert_eq!(x.len() % tokens, 0, "activation shape mismatch");
+    let in_features = x.len() / tokens;
+    assert_eq!(quantized.len(), out_features * in_features, "weight shape mismatch");
+    assert_eq!(out_t.len(), out_features * tokens, "output shape mismatch");
+
+    if !vnni_available() {
+        return matmul_i8_auto(quantized, scales, x, tokens, out_t);
+    }
+
+    // Quantize every token once. Three allocations for the whole call rather
+    // than three per token, and the result is read-only from here on.
+    let per_token_blocks = in_features.div_ceil(block);
+    let mut xq = vec![0i8; tokens * in_features];
+    let mut x_scales = vec![0.0f32; tokens * per_token_blocks];
+    let mut offsets = vec![0.0f32; tokens];
+    for t in 0..tokens {
+        offsets[t] = quantize_activations_blocked_into(
+            &x[t * in_features..(t + 1) * in_features],
+            block,
+            &mut xq[t * in_features..(t + 1) * in_features],
+            &mut x_scales[t * per_token_blocks..(t + 1) * per_token_blocks],
+        );
+    }
+
+    let rows = |weights: &[i8], row_scales: &[f32], chunk: &mut [f32]| {
+        for (row, row_scale) in row_scales.iter().enumerate() {
+            let w = &weights[row * in_features..(row + 1) * in_features];
+            for t in 0..tokens {
+                let activations = &xq[t * in_features..(t + 1) * in_features];
+                let block_scales =
+                    &x_scales[t * per_token_blocks..(t + 1) * per_token_blocks];
+                // SAFETY: vnni_available() checked above; lengths match by the
+                // assertions and the slicing here.
+                let acc = unsafe {
+                    dot_i8_blocked_vnni(w, activations, block_scales, block)
+                };
+                chunk[row * tokens + t] = (acc - offsets[t]) * row_scale;
+            }
+        }
+    };
+
+    let threads = rayon::current_num_threads();
+    if threads <= 1 || out_features < threads * 8 {
+        rows(quantized, scales, out_t);
+        return;
+    }
+
+    let rows_per_thread = out_features.div_ceil(threads);
+    out_t
+        .par_chunks_mut(rows_per_thread * tokens)
+        .enumerate()
+        .for_each(|(block_index, chunk)| {
+            let row_start = block_index * rows_per_thread;
+            let count = chunk.len() / tokens;
+            rows(
+                &quantized[row_start * in_features..(row_start + count) * in_features],
+                &scales[row_start..row_start + count],
+                chunk,
+            );
+        });
+}
+
+/// Block-wise VNNI batch matmul over the C ABI.
+///
+/// # Safety
+/// As [`nanoinfer_matmul_i8`]. `block` must be positive.
+#[no_mangle]
+pub unsafe extern "C" fn nanoinfer_matmul_i8_vnni_blocked(
+    quantized: *const i8,
+    scales: *const f32,
+    x: *const f32,
+    out_t: *mut f32,
+    out_features: usize,
+    in_features: usize,
+    tokens: usize,
+    block: usize,
+) {
+    let quantized = std::slice::from_raw_parts(quantized, out_features * in_features);
+    let scales = std::slice::from_raw_parts(scales, out_features);
+    let x = std::slice::from_raw_parts(x, tokens * in_features);
+    let out_t = std::slice::from_raw_parts_mut(out_t, out_features * tokens);
+    matmul_i8_vnni_blocked(quantized, scales, x, tokens, block, out_t);
 }
