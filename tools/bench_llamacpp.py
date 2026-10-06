@@ -244,6 +244,34 @@ def main(argv: list[str] | None = None) -> int:
         margin = theirs / ours if ours < theirs else ours / theirs
         leader = mine if ours < theirs else name
         print(f"{mine} {ours:.2f} ms/tok against {name} {theirs:.2f} ms/tok")
+
+        # Control: llama.cpp's code does not change between runs, so its own
+        # number is a thermometer for the machine. A run where it reads far
+        # from the best ever recorded is not comparable to one where it does,
+        # whatever the paired test says.
+        #
+        # This exists because the paired test has a blind spot. It is robust to
+        # noise that hits both contenders equally and blind to noise that does
+        # not: on a loaded laptop this engine slowed by 1.3x while llama.cpp
+        # slowed by 3.7x, so every rep favoured this engine and the test
+        # reported a clean 8/8 sweep on a measurement worth nothing.
+        history = []
+        if args.out.exists():
+            for line in args.out.read_text(encoding="utf-8").splitlines():
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                for row in record.get("rows") or []:
+                    if row.get("engine") == name and row.get("decode_ms"):
+                        history.append(row["decode_ms"])
+        reference = min(history, default=None)
+        if reference is not None and theirs > reference * 1.5:
+            print(f"  CONTROL FAILED: {name} read {theirs:.2f} ms/tok against a "
+                  f"best-ever {reference:.2f}. Its code has not changed, so this "
+                  f"machine is {theirs / reference:.1f}x off its own baseline. "
+                  f"The verdict below is not comparable to earlier runs.")
+
         mine_each = seen[mine]["decode"]
         theirs_each = seen[name]["decode"]
         pairs = list(zip(mine_each, theirs_each))
@@ -275,6 +303,11 @@ def main(argv: list[str] | None = None) -> int:
                     "llama_threads_q8": args.threads_q8,
                     "nanoinfer_blas_threads": blas_threads,
                     "ms_per_token": best,
+                    "rows": [
+                        {"engine": engine, "decode_ms": best[engine]["decode"],
+                         "prefill_ms": best[engine]["prefill"]}
+                        for engine in best
+                    ],
                 }
             )
             + "\n"

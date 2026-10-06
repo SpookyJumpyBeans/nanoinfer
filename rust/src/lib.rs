@@ -1192,9 +1192,19 @@ unsafe fn dot_i8_blocked_vnni(w: &[i8], xq: &[i8], x_scales: &[f32], block: usiz
     let mut acc = _mm256_setzero_ps();
     let mut offset = 0;
 
-    // Whole 32-byte groups. One dpbusd, one convert, one fmadd each: three
-    // instructions more per 32 bytes than the per-row kernel, against the
-    // eight-at-a-time float widening this replaced.
+    // The block index advances on a counter rather than being recomputed as
+    // `offset / block`. That divide sat in the innermost loop, once per 32
+    // bytes, at 20-40 cycles against roughly 5 for the dpbusd it feeds -- and
+    // it is where the blocked kernel's 55.57 ms/token went against the per-row
+    // kernel's 32.45. A counter is also correct for any block that is a
+    // multiple of 32, which an earlier `b += 32 / block.min(32)` was not.
+    let steps_per_block = (block / 32).max(1);
+    let mut steps = 0usize;
+    let mut b = 0usize;
+
+    // Whole 32-byte groups: one load, one xor, one load, one dpbusd, one
+    // convert, one fmadd. Against the per-row kernel that is a convert and an
+    // fmadd more; against the float widening it replaced it is far less.
     while offset + 32 <= in_features && block >= 32 {
         _mm_prefetch::<_MM_HINT_T0>(wp.add(offset + PREFETCH_BYTES) as *const i8);
 
@@ -1205,16 +1215,16 @@ unsafe fn dot_i8_blocked_vnni(w: &[i8], xq: &[i8], x_scales: &[f32], block: usiz
         let xv = _mm256_loadu_si256(xp.add(offset) as *const __m256i);
         let products = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wv, xv);
 
-        // The block index comes from the offset, not from a running counter
-        // scaled by the block size. Incrementing by a ratio was wrong for any
-        // block wider than 32: with block = 128 it walked a one-element scale
-        // array four times over and read whatever followed it.
-        let b = offset / block;
         debug_assert!(b < x_scales.len(), "block index past the scale array");
         let scale = _mm256_set1_ps(*x_scales.get_unchecked(b));
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(products), scale, acc);
 
         offset += 32;
+        steps += 1;
+        if steps == steps_per_block {
+            steps = 0;
+            b += 1;
+        }
     }
 
     let high = _mm256_extractf128_ps(acc, 1);
