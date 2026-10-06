@@ -334,7 +334,9 @@ def test_a_decode_step_makes_four_kernel_calls_per_layer(tiny_weights, monkeypat
 
     calls = []
     real = kernels.matmul_i8
-    monkeypatch.setattr(kernels, "matmul_i8", lambda *a: calls.append(1) or real(*a))
+    monkeypatch.setattr(
+        kernels, "matmul_i8", lambda *a, **kw: calls.append(1) or real(*a, **kw)
+    )
     model.next_token_logits(np.array([22]), cache=cache)
 
     assert len(calls) == 4 * len(stored.layers) + 1

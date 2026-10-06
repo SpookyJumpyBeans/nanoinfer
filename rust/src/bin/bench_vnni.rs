@@ -30,10 +30,10 @@ fn main() {
     }
     println!("best of 50\n");
     println!(
-        "{:<22} {:>10} {:>10} {:>10}",
-        "shape", "avx2 ms", "vnni ms", "speedup"
+        "{:<22} {:>9} {:>9} {:>11} {:>9}",
+        "shape", "avx2 ms", "per-row", "blocked 32", "vs avx2"
     );
-    println!("{}", "-".repeat(56));
+    println!("{}", "-".repeat(64));
 
     // Every linear projection a decode step runs, plus the LM head, which is
     // the largest single read and so the one most likely to be memory-bound
@@ -50,6 +50,7 @@ fn main() {
 
     let mut total_avx = 0.0;
     let mut total_vnni = 0.0;
+    let mut total_blocked = 0.0;
 
     for (name, out_features, in_features) in shapes {
         let weights = pseudo_random(out_features * in_features, 21);
@@ -60,21 +61,29 @@ fn main() {
         let runs = if *out_features > 100_000 { 10 } else { 50 };
         let avx = best_of(|| matvec_i8_auto(&quantized, &scales, &x, &mut out), runs);
         let vnni = best_of(|| matvec_i8_vnni(&quantized, &scales, &x, &mut out), runs);
+        // The configuration that ties llama.cpp on quality, which is the one
+        // that has to be fast. The per-row column is faster and costs +3.03%
+        // perplexity, so it is here for reference rather than as the target.
+        let blocked = best_of(
+            || matvec_i8_vnni_blocked(&quantized, &scales, &x, 32, &mut out),
+            runs,
+        );
 
         total_avx += avx;
         total_vnni += vnni;
+        total_blocked += blocked;
 
         println!(
-            "{name:<22} {avx:>10.3} {vnni:>10.3} {:>9.2}x",
-            avx / vnni
+            "{name:<22} {avx:>9.3} {vnni:>9.3} {blocked:>11.3} {:>8.2}x",
+            avx / blocked
         );
     }
 
-    println!("{}", "-".repeat(56));
+    println!("{}", "-".repeat(64));
     println!(
-        "{:<22} {total_avx:>10.3} {total_vnni:>10.3} {:>9.2}x",
-        "one token, all of it",
-        total_avx / total_vnni
+        "{:<22} {total_avx:>9.3} {total_vnni:>9.3} {total_blocked:>11.3} {:>8.2}x",
+        "one call of each",
+        total_avx / total_blocked
     );
 
     // What the whole model costs, which is the number that has to beat

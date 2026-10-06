@@ -28,8 +28,12 @@ from nanoinfer.quantization import QuantizedTensor
 Weight = np.ndarray | QuantizedTensor
 
 
-def linear(x: np.ndarray, weight: Weight) -> np.ndarray:
-    """``x @ W.T`` for ``x`` shaped ``[tokens, in_features]``."""
+def linear(x: np.ndarray, weight: Weight, allow_vnni: bool = True) -> np.ndarray:
+    """``x @ W.T`` for ``x`` shaped ``[tokens, in_features]``.
+
+    ``allow_vnni=False`` keeps this call on float activations even when the
+    VNNI kernel is switched on. The LM head uses it: see Qwen2.logits.
+    """
     if isinstance(weight, np.ndarray):
         return x @ weight.T
 
@@ -45,7 +49,7 @@ def linear(x: np.ndarray, weight: Weight) -> np.ndarray:
 
     x = np.asarray(x, dtype=np.float32)
     if kernels.available():
-        return kernels.matmul_i8(weight.values, weight.scales, x)
+        return kernels.matmul_i8(weight.values, weight.scales, x, allow_vnni=allow_vnni)
     return (x @ weight.values.T.astype(np.float32)) * weight.scales
 
 

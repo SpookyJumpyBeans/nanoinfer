@@ -1188,45 +1188,66 @@ unsafe fn dot_i8_blocked_vnni(w: &[i8], xq: &[i8], x_scales: &[f32], block: usiz
     let wp = w.as_ptr();
     let xp = xq.as_ptr();
     let sign_flip = _mm256_set1_epi8(-128i8); // 0x80
+    let zero = _mm256_setzero_si256();
 
-    let mut acc = _mm256_setzero_ps();
+    // Four f32 accumulators, not one. The previous version folded every
+    // 32-byte group into a single register with fmadd, so each group waited
+    // ~4 cycles on the one before it: a serial latency chain that cost
+    // everything VPDPBUSD saved, and left the blocked kernel measuring no
+    // faster than the float-activation path (45.36 against 44.25 ms/token).
+    // Four independent chains let the core overlap them, which is what the
+    // per-row kernel's four i32 accumulators were already doing.
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
     let mut offset = 0;
 
-    // The block index advances on a counter rather than being recomputed as
-    // `offset / block`. That divide sat in the innermost loop, once per 32
-    // bytes, at 20-40 cycles against roughly 5 for the dpbusd it feeds -- and
-    // it is where the blocked kernel's 55.57 ms/token went against the per-row
-    // kernel's 32.45. A counter is also correct for any block that is a
-    // multiple of 32, which an earlier `b += 32 / block.min(32)` was not.
-    let steps_per_block = (block / 32).max(1);
-    let mut steps = 0usize;
-    let mut b = 0usize;
+    // A power-of-two block lets the block index be a shift rather than a
+    // divide or a counter; every block size this engine uses (16, 32, 64,
+    // 128) is one. Anything else takes the scalar path below, which is
+    // correct for any block.
+    if block >= 32 && block.is_power_of_two() {
+        let shift = block.trailing_zeros();
 
-    // Whole 32-byte groups: one load, one xor, one load, one dpbusd, one
-    // convert, one fmadd. Against the per-row kernel that is a convert and an
-    // fmadd more; against the float widening it replaced it is far less.
-    while offset + 32 <= in_features && block >= 32 {
-        _mm_prefetch::<_MM_HINT_T0>(wp.add(offset + PREFETCH_BYTES) as *const i8);
+        while offset + 128 <= in_features {
+            _mm_prefetch::<_MM_HINT_T0>(wp.add(offset + PREFETCH_BYTES) as *const i8);
 
-        let wv = _mm256_xor_si256(
-            _mm256_loadu_si256(wp.add(offset) as *const __m256i),
-            sign_flip,
-        );
-        let xv = _mm256_loadu_si256(xp.add(offset) as *const __m256i);
-        let products = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wv, xv);
+            let w0 = _mm256_xor_si256(_mm256_loadu_si256(wp.add(offset) as *const __m256i), sign_flip);
+            let w1 = _mm256_xor_si256(_mm256_loadu_si256(wp.add(offset + 32) as *const __m256i), sign_flip);
+            let w2 = _mm256_xor_si256(_mm256_loadu_si256(wp.add(offset + 64) as *const __m256i), sign_flip);
+            let w3 = _mm256_xor_si256(_mm256_loadu_si256(wp.add(offset + 96) as *const __m256i), sign_flip);
 
-        debug_assert!(b < x_scales.len(), "block index past the scale array");
-        let scale = _mm256_set1_ps(*x_scales.get_unchecked(b));
-        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(products), scale, acc);
+            let p0 = _mm256_dpbusd_avx_epi32(zero, w0, _mm256_loadu_si256(xp.add(offset) as *const __m256i));
+            let p1 = _mm256_dpbusd_avx_epi32(zero, w1, _mm256_loadu_si256(xp.add(offset + 32) as *const __m256i));
+            let p2 = _mm256_dpbusd_avx_epi32(zero, w2, _mm256_loadu_si256(xp.add(offset + 64) as *const __m256i));
+            let p3 = _mm256_dpbusd_avx_epi32(zero, w3, _mm256_loadu_si256(xp.add(offset + 96) as *const __m256i));
 
-        offset += 32;
-        steps += 1;
-        if steps == steps_per_block {
-            steps = 0;
-            b += 1;
+            // Each 32-byte group lies inside exactly one block, because both
+            // the offset and the block size are multiples of 32.
+            let s0 = _mm256_set1_ps(*x_scales.get_unchecked(offset >> shift));
+            let s1 = _mm256_set1_ps(*x_scales.get_unchecked((offset + 32) >> shift));
+            let s2 = _mm256_set1_ps(*x_scales.get_unchecked((offset + 64) >> shift));
+            let s3 = _mm256_set1_ps(*x_scales.get_unchecked((offset + 96) >> shift));
+
+            acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), s0, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1), s1, acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p2), s2, acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p3), s3, acc3);
+            offset += 128;
+        }
+
+        // Whole 32-byte groups left over from the 128-byte stride.
+        while offset + 32 <= in_features {
+            let wv = _mm256_xor_si256(_mm256_loadu_si256(wp.add(offset) as *const __m256i), sign_flip);
+            let p = _mm256_dpbusd_avx_epi32(zero, wv, _mm256_loadu_si256(xp.add(offset) as *const __m256i));
+            let s = _mm256_set1_ps(*x_scales.get_unchecked(offset >> shift));
+            acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), s, acc0);
+            offset += 32;
         }
     }
 
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
     let high = _mm256_extractf128_ps(acc, 1);
     let low = _mm256_castps256_ps128(acc);
     let mut sum128 = _mm_add_ps(low, high);
@@ -1234,13 +1255,16 @@ unsafe fn dot_i8_blocked_vnni(w: &[i8], xq: &[i8], x_scales: &[f32], block: usiz
     sum128 = _mm_hadd_ps(sum128, sum128);
     let mut total = _mm_cvtss_f32(sum128);
 
-    // Whatever is left: a block narrower than 32, or a ragged tail. Same
-    // arithmetic in scalar form, including the 0x80 offset, so the caller's
-    // precomputed correction still covers the whole row.
+    // Whatever is left: a tail shorter than 32 bytes, or every byte of a
+    // block size the vector path does not take. Same arithmetic in scalar
+    // form, including the 0x80 offset, so the caller's precomputed correction
+    // still covers the whole row. After the vector path the offset is a
+    // multiple of 32 and the tail is under 32 bytes, so it never crosses a
+    // block boundary.
     while offset < in_features {
         let b_index = offset / block;
         let scale = *x_scales.get_unchecked(b_index);
-        let end = (offset + block.min(in_features - offset)).min(in_features);
+        let end = ((b_index + 1) * block).min(in_features);
         let mut partial = 0i32;
         for i in offset..end {
             let unsigned = (*wp.add(i) as i32) + 128;

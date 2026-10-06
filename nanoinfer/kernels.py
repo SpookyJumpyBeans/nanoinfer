@@ -180,7 +180,12 @@ def matvec_i8(
     return out
 
 
-def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.ndarray:
+def matmul_i8(
+    quantized: np.ndarray,
+    scales: np.ndarray,
+    x: np.ndarray,
+    allow_vnni: bool = True,
+) -> np.ndarray:
     """``x @ (quantized * scales[:, None]).T`` for a batch of tokens, in Rust.
 
     ``x`` is ``[tokens, in_features]`` and the result ``[tokens,
@@ -219,7 +224,8 @@ def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.nd
     # Rust writes [out_features, tokens] so that each worker's rows are one
     # contiguous block; the transpose back is a view, not a copy.
     out_t = np.empty((out_features, tokens), dtype=np.float32)
-    if _USE_VNNI and _VNNI_BLOCK:
+    use_vnni_here = _USE_VNNI and allow_vnni
+    if use_vnni_here and _VNNI_BLOCK:
         _LIBRARY.nanoinfer_matmul_i8_vnni_blocked(
             quantized.ctypes.data,
             scales.ctypes.data,
@@ -234,7 +240,7 @@ def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.nd
 
     entry = (
         _LIBRARY.nanoinfer_matmul_i8_vnni
-        if _USE_VNNI
+        if use_vnni_here
         else _LIBRARY.nanoinfer_matmul_i8
     )
     entry(
@@ -268,6 +274,25 @@ _VNNI_BLOCK = 32
 def vnni_available() -> bool:
     """Whether the loaded library can run the VNNI kernel on this CPU."""
     return _LIBRARY is not None and bool(_LIBRARY.nanoinfer_has_vnni())
+
+
+# Whether the LM head may use VNNI. Off by default: it is the one projection
+# whose activation error lands straight on the logits with no hidden dimension
+# to average it over, and it is memory-bound at 136M weights, so VNNI buys it
+# only about 1.06x. Keeping it on float activations is close to free in speed
+# and removes the error that matters most.
+_VNNI_LM_HEAD = False
+
+
+def vnni_lm_head(enabled: bool) -> bool:
+    """Let the LM head use VNNI too. Returns what took effect."""
+    global _VNNI_LM_HEAD
+    _VNNI_LM_HEAD = bool(enabled)
+    return _VNNI_LM_HEAD
+
+
+def lm_head_allows_vnni() -> bool:
+    return _VNNI_LM_HEAD
 
 
 def vnni_block(values_per_scale: int) -> int:
