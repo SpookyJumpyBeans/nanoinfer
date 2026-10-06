@@ -1380,3 +1380,27 @@ pub unsafe extern "C" fn nanoinfer_matmul_i8_vnni_blocked(
     let out_t = std::slice::from_raw_parts_mut(out_t, out_features * tokens);
     matmul_i8_vnni_blocked(quantized, scales, x, tokens, block, out_t);
 }
+
+/// Size the global worker pool. Returns the thread count that took effect.
+///
+/// Must run before any parallel kernel, because rayon's global pool is built
+/// once, on first use, and cannot be resized. If it already exists this does
+/// nothing and reports the existing size, so a caller can tell.
+///
+/// Rayon's default is one worker per logical CPU -- 20 on this laptop -- and
+/// that is the worst setting measured. Alder Lake has 6 fast P-cores and 8
+/// slow E-cores, and an even split of rows leaves the fast cores waiting on the
+/// slow ones, 97 times per decoded token. Swept on the real model:
+///
+///   threads   1      2      4      6      8      20
+///   vnni    48.11  44.40  32.77  38.18  42.84  55.42  ms/token
+///
+/// It is the same failure phase 8 found in llama.cpp, which is fastest at -t 1
+/// for the same reason, recurring in this crate's own pool.
+#[no_mangle]
+pub extern "C" fn nanoinfer_set_threads(threads: usize) -> i32 {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .build_global();
+    rayon::current_num_threads() as i32
+}

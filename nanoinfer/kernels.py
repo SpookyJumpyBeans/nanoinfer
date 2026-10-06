@@ -28,6 +28,10 @@ import numpy as np
 
 _LIBRARY_STEM = "nanoinfer_kernels"
 
+# Worker threads for the Rust kernels, unless NANOINFER_THREADS says
+# otherwise. See the comment where the pool is sized in _load().
+DEFAULT_THREADS = 4
+
 
 def _candidate_paths() -> list[Path]:
     """Where a built library might be, most specific first."""
@@ -91,6 +95,18 @@ def _load() -> ctypes.CDLL | None:
         library.nanoinfer_has_vnni.restype = ctypes.c_int
         library.nanoinfer_num_threads.argtypes = []
         library.nanoinfer_num_threads.restype = ctypes.c_int
+        library.nanoinfer_set_threads.argtypes = [ctypes.c_size_t]
+        library.nanoinfer_set_threads.restype = ctypes.c_int
+
+        # Size the worker pool before anything can touch it. Rayon builds its
+        # global pool once, on first use, at one worker per logical CPU -- 20
+        # here, and the slowest setting measured: the even row split leaves the
+        # six P-cores waiting on the eight E-cores, 97 times per token. Four
+        # was fastest in a sweep on the real model (32.77 ms/token against
+        # 55.42 at 20). NANOINFER_THREADS overrides it, since the best count
+        # is a property of the machine, not of the code.
+        requested = int(os.environ.get("NANOINFER_THREADS", DEFAULT_THREADS))
+        library.nanoinfer_set_threads(requested)
         return library
     return None
 

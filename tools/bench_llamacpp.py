@@ -205,10 +205,13 @@ def main(argv: list[str] | None = None) -> int:
         f"{'decode ms/tok':>14} {'spread':>8} {'decode tok/s':>13}"
     )
     print("-" * 82)
+    # The int8 rows run on the Rust pool, not OpenBLAS, so they report its
+    # size: that setting moved decode by 1.69x on its own.
+    rust_threads = str(kernels.describe()["threads"])
     rows = [("nanoinfer f32", str(blas_threads)),
-            ("nanoinfer int8", str(blas_threads))]
+            ("nanoinfer int8", rust_threads)]
     if kernels.vnni_available():
-        rows.append(("nanoinfer vnni", str(blas_threads)))
+        rows.append(("nanoinfer vnni", rust_threads))
     rows += [(name, str(threads)) for name, _, threads in contenders]
     spreads = {}
     for name, threads in rows:
