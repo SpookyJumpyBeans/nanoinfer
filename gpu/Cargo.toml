@@ -1,0 +1,12 @@
+[package]
+name = "nanoinfer-gpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "1.0.1"
+wgpu = "30"
+
+[dev-dependencies]
+nanoinfer-kernels = { path = "../rust" }
