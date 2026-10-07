@@ -29,7 +29,7 @@ against the uncached path. [More below.](#running-it)
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
 | 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done, wired in, AVX-VNNI**; WebGPU measured and rejected |
-| 8 | Benchmark against llama.cpp on identical hardware | **done** — quality tied (+0.85% vs +0.87%), decode leads 1.2–1.4× |
+| 8 | Benchmark against llama.cpp on identical hardware | **done** — int8 costs +0.13% perplexity to llama.cpp's +0.87%; decode 1.63× ahead in one clean run (p = 0.019), repeat pending |
 
 Each phase is verified against a reference implementation before the next one
 starts. Correctness first; a fast wrong answer teaches nothing.
@@ -467,60 +467,69 @@ finishing that would be worth. (They are now — see
 is a compute-bound matmul over the whole prompt, which is the regime where better
 kernels do pay. (No longer true either — see below.)
 
-### AVX-VNNI, and the gap closed
+### Where it landed: plain int8, not VNNI
 
-Every decode number above is superseded. Twelve reps, five engines alternating
-inside each rep, each at its own best thread count:
+Every decode number above is superseded, and so is the conclusion the first
+draft of this section drew. Twelve reps, five engines alternating inside each
+rep, each at its own best thread count:
 
 | engine | threads | prefill ms/tok | decode ms/tok | decode tok/s |
 |---|---:|---:|---:|---:|
-| nanoinfer f32 | 6 | 26.07 | 72.82 | 13.73 |
-| nanoinfer int8 | 6 | 15.25 | 59.52 | 16.80 |
-| **nanoinfer int8 + VNNI** | 6 | **15.04** | **32.45** | **30.82** |
-| llama.cpp f32 | 3 | 15.73 | 80.65 | 12.40 |
-| llama.cpp Q8_0 | 1 | 14.93 | 38.79 | 25.78 |
+| nanoinfer f32 | 6 | 26.38 | 62.44 | 16.02 |
+| **nanoinfer int8** | 4 | 10.70 | **23.13** | **43.24** |
+| nanoinfer int8 + VNNI | 4 | **8.88** | 26.75 | 37.39 |
+| llama.cpp f32 | 3 | 14.90 | 72.20 | 13.85 |
+| llama.cpp Q8_0 | 1 | 14.54 | 37.75 | 26.49 |
 
-That run used **one activation scale per row**, which is fast and costs more
-quality than llama.cpp pays. The version in the tree now uses **one scale per
-32 values**, which ties on quality. The two claims are therefore measured on
-different configurations, and they are reported separately rather than merged
-into one flattering sentence.
+**Quality: int8 costs less than llama.cpp, and this part is settled.**
+Perplexity on the same 2944 held-out tokens, each engine against **its own** f32
+baseline because the two harnesses window the text differently and disagree on
+absolutes. Perplexity is deterministic, so unlike the timings these figures do
+not move with machine load:
 
-**Quality is a tie, and this part is settled.** Perplexity on 512 held-out
-tokens, each engine against **its own** f32 baseline since the two harnesses
-disagree on absolutes. Perplexity is deterministic, so unlike the timings these
-figures do not move with machine load:
-
-| | f32 | int8 | cost |
+| | f32 | quantized | cost |
 |---|---:|---:|---:|
-| llama.cpp Q8_0 | 17.9717 | 18.1280 | **+0.87%** |
-| nanoinfer int8, f32 activations | 23.2690 | 23.3133 | +0.19% |
-| nanoinfer int8 + VNNI, one scale per row | 23.2690 | 23.9746 | +3.03% |
-| **nanoinfer int8 + VNNI, scale per 32** | 23.2690 | 23.4670 | **+0.85%** |
+| llama.cpp Q8_0 | | | **+0.87%** |
+| **nanoinfer int8, f32 activations, f32 embeddings** | 23.6851 | 23.7164 | **+0.13%** |
+| nanoinfer int8, f32 activations, int8 embeddings | 23.6851 | 23.7595 | +0.31% |
+| nanoinfer int8 + VNNI, scale per 32, LM head f32 | 23.6851 | 23.8286 | +0.61% |
 
-0.85% against 0.87%, where llama.cpp's own estimate carries ±1.19 on 18.13 —
-about ±6.6%. Nothing that close is a quality win for either side, so this is a
-tie, not a victory.
+The gap is mostly structural. llama.cpp's Q8_0 kernel quantizes activations to
+8 bits so it can use integer dot products; nanoinfer's default path keeps them
+in f32 and quantizes only the weights. The VNNI path makes the same trade as
+llama.cpp and lands between the two.
 
-**Speed leads, but is not yet nailed down at the tied-quality setting.** The
-12-of-12 sweep above was the per-row kernel. The blocked kernel has only been
-timed on a laptop by then several hours into continuous benchmarking, where it
-led by 1.37× on minima and won 10 of 12 paired reps. That run is visibly
-throttled: every engine was about twice as slow as the clean run, llama.cpp
-included, on llama.cpp code that had not changed —
-
-| | clean run | throttled run |
-|---|---:|---:|
-| nanoinfer f32 | 72.82 | 130.12 |
-| llama.cpp Q8_0 | 38.79 | 93.61 |
-
-— so the relative picture is readable and the absolute numbers are not. What is
-outstanding is one clean run at block 32 to confirm the sweep holds at tied
-quality:
+**Speed: one clean run supports it; it needs to repeat.** On decode, int8 led
+llama.cpp Q8_0 by **1.63×** on per-engine minima and won **10 of 12** paired
+reps — an exact one-sided sign test puts that at **p = 0.019**. The control
+read clean: llama.cpp, whose code does not change between runs, came in at
+37.75 ms/token against a best-ever 32.50 (1.16×). Two caveats belong next to
+that number rather than below it. In the reps it lost, int8 lost badly — the
+worst rep had llama.cpp 2× ahead — so the per-rep picture is noisy even when
+the count is not. And one run at p = 0.019 is evidence, not a result; the
+claim stands once a second clean run agrees.
 
 ```sh
 OPENBLAS_NUM_THREADS=6 python -m tools.bench_llamacpp --llama-cpp ../llama.cpp --reps 12
 ```
+
+Prefill is the other way round from earlier phases: on minima nanoinfer now
+leads it too, with VNNI fastest there — though the paired test was only run on
+decode, so that is a reading, not a claim. Prefill is a matrix-matrix product, compute-bound
+rather than memory-bound, which is exactly where 32-bytes-per-instruction pays.
+
+**What changed between "llama.cpp wins 1.65×" and this:** the Rust thread pool.
+Rayon sizes its global pool to every logical CPU — 20 here, 6 fast cores and
+8 slow ones — and splitting a memory-bound matvec evenly across them leaves the
+fast cores waiting on the slow ones. The same trap phase 8 caught llama.cpp in
+with `-t 20`, sprung on this engine instead. A sweep put both int8 kernels best
+at four threads; `nanoinfer_set_threads` now sizes the pool at load, and
+`NANOINFER_THREADS` overrides it.
+
+An earlier draft of this section reported a 12-of-12 sweep for VNNI at 32.45
+ms/token. That was real, but it was the per-row activation scale, which costs
++3.03% perplexity, and it predates the thread-pool fix. It does not describe
+anything in the tree now.
 
 ### Why one scale per row was the wrong granularity
 
@@ -611,7 +620,14 @@ look *less* certain. Eight reps reported spreads of 1.4–2.2×; twenty reported
 What works is the paired test. The contenders already alternate inside each rep,
 so every rep is a matched pair under shared conditions, and counting wins is a
 sign test — robust to exactly the stalls that move the absolute numbers around.
-Twelve of twelve is p ≈ 0.0002, and it did not need a quiet machine to say so.
+
+It is not robust to stalls that hit one contender harder than the other, and
+that is how it got this wrong a third time. On a loaded laptop this engine
+slowed 1.3× while llama.cpp slowed 3.7×, so every rep favoured this engine and
+the test reported a clean sweep on a measurement worth nothing. The fix is a
+control: llama.cpp's code never changes between runs, so its own number is a
+thermometer for the machine, and a run where it reads more than 1.5× off its
+best ever is flagged as not comparable whatever the sign test says.
 
 ### Handing your opponent a bad flag is not a benchmark
 
