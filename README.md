@@ -29,7 +29,7 @@ against the uncached path. [More below.](#running-it)
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
 | 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done, wired in, AVX-VNNI**; WebGPU measured and rejected |
-| 8 | Benchmark against llama.cpp on identical hardware | **done** — int8 costs +0.13% perplexity to llama.cpp's +0.87%; decode 1.63× ahead in one clean run (p = 0.019), repeat pending |
+| 8 | Benchmark against llama.cpp on identical hardware | **done** — int8 costs +0.13% perplexity to llama.cpp's +0.87%; decode 1.44–1.63× ahead in two clean runs (10/12 and 12/12 paired reps) |
 
 Each phase is verified against a reference implementation before the next one
 starts. Correctness first; a fast wrong answer teaches nothing.
@@ -471,15 +471,16 @@ kernels do pay. (No longer true either — see below.)
 
 Every decode number above is superseded, and so is the conclusion the first
 draft of this section drew. Twelve reps, five engines alternating inside each
-rep, each at its own best thread count:
+rep, each at its own best thread count; the cleanest run recorded, with
+llama.cpp 1.06× off its best ever:
 
 | engine | threads | prefill ms/tok | decode ms/tok | decode tok/s |
 |---|---:|---:|---:|---:|
-| nanoinfer f32 | 6 | 26.38 | 62.44 | 16.02 |
-| **nanoinfer int8** | 4 | 10.70 | **23.13** | **43.24** |
-| nanoinfer int8 + VNNI | 4 | **8.88** | 26.75 | 37.39 |
-| llama.cpp f32 | 3 | 14.90 | 72.20 | 13.85 |
-| llama.cpp Q8_0 | 1 | 14.54 | 37.75 | 26.49 |
+| nanoinfer f32 | 6 | 25.61 | 67.19 | 14.88 |
+| **nanoinfer int8** | 4 | 9.27 | **23.90** | **41.84** |
+| nanoinfer int8 + VNNI | 4 | **8.61** | 24.86 | 40.23 |
+| llama.cpp f32 | 3 | 15.19 | 74.32 | 13.46 |
+| llama.cpp Q8_0 | 1 | 14.52 | 34.37 | 29.10 |
 
 **Quality: int8 costs less than llama.cpp, and this part is settled.**
 Perplexity on the same 2944 held-out tokens, each engine against **its own** f32
@@ -499,15 +500,25 @@ The gap is mostly structural. llama.cpp's Q8_0 kernel quantizes activations to
 in f32 and quantizes only the weights. The VNNI path makes the same trade as
 llama.cpp and lands between the two.
 
-**Speed: one clean run supports it; it needs to repeat.** On decode, int8 led
-llama.cpp Q8_0 by **1.63×** on per-engine minima and won **10 of 12** paired
-reps — an exact one-sided sign test puts that at **p = 0.019**. The control
-read clean: llama.cpp, whose code does not change between runs, came in at
-37.75 ms/token against a best-ever 32.50 (1.16×). Two caveats belong next to
-that number rather than below it. In the reps it lost, int8 lost badly — the
-worst rep had llama.cpp 2× ahead — so the per-rep picture is noisy even when
-the count is not. And one run at p = 0.019 is evidence, not a result; the
-claim stands once a second clean run agrees.
+**Speed: int8 decodes faster, on an idle machine.** Every run since the
+thread-pool fix, decode only, int8 against llama.cpp Q8_0:
+
+| run | control (llama.cpp vs best ever) | int8 lead on minima | paired wins | sign test p |
+|---|---:|---:|---:|---:|
+| 1 | 1.16× — ok | 1.63× | 10 / 12 | 0.019 |
+| 2 | 1.50× — **failed** | 0.89× (llama.cpp ahead) | 4 / 12 | 0.93 |
+| 3 | 1.06× — ok | 1.44× | **12 / 12** | 0.0002 |
+
+Both clean runs pass on their own, and in the second every rep favoured int8 —
+the worst by 1.09×. The decision rule was fixed before run 3 was taken, which is
+what makes it a confirmation rather than a search.
+
+Run 2 is reported because it is the honest limit on the claim. It was taken
+with the battery at 19% and charging, and the slowdown was lopsided: int8 went
+from 23 to 55 ms/token, 2.4×, while llama.cpp went 1.3×. A matvec split across
+four cores loses more to a throttled or busy CPU than one pinned to a single
+core does. So the lead is real on an idle, cool laptop and does not survive
+contention — which is a property of the engine, not just of the measurement.
 
 ```sh
 OPENBLAS_NUM_THREADS=6 python -m tools.bench_llamacpp --llama-cpp ../llama.cpp --reps 12
