@@ -190,7 +190,7 @@ class QuantizationReport:
 def quantize_model(
     weights,
     bits: int = 8,
-    quantize_embeddings: bool = False,
+    quantize_embeddings: bool = True,
     group_size: int = INT4_GROUP_SIZE,
     dequantize: bool = True,
 ):
@@ -205,11 +205,21 @@ def quantize_model(
     The two compute on identical integer values and differ only in float32
     summation order. INT4 has no kernel, so it is simulation only.
 
-    ``quantize_embeddings`` is off by default. The embedding matrix is 27.6% of
-    this model's parameters, so including it is tempting -- but it does double
-    duty as the output projection, where its errors land directly on the logits
-    rather than being averaged over a hidden dimension first. It is offered as
-    a flag so the cost can be measured rather than assumed.
+    ``quantize_embeddings`` is **on** by default, which it was not originally.
+    The argument against it was that the embedding matrix does double duty as
+    the output projection, so its errors land straight on the logits rather
+    than being averaged over a hidden dimension first. That is true and it is
+    not worth 27.6% of the parameters: the measurements went against it twice.
+
+    Phase 6 swept the quality cost at **0.02 percentage points** of perplexity
+    for another 0.41 GB. Phase 7's kernels then made it the difference between
+    0.90 GB and 0.50 GB of weights read per token, and decode is bound by bytes
+    read -- so on this machine, with the real model, including the embeddings
+    is the single largest speedup in the engine.
+
+    Pass ``quantize_embeddings=False`` to get the old behaviour. The flag stays
+    because the cost should remain measurable, but the conservative default was
+    wrong on both axes it was being conservative about.
 
     Norm weights and biases are never quantized. They are 43,904 parameters in
     total, under 0.01% of the model, and they scale everything downstream of

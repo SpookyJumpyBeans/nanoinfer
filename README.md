@@ -28,8 +28,8 @@ against the uncached path. [More below.](#running-it)
 | 4 | KV cache; identical output, measured speedup | **done** |
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
-| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done and wired in**; WebGPU kernel written and verified, not yet timed on a GPU |
-| 8 | Benchmark against llama.cpp on identical hardware | **done** |
+| 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done, wired in, AVX-VNNI**; WebGPU measured and rejected |
+| 8 | Benchmark against llama.cpp on identical hardware | **done** — int8 costs +0.13% perplexity to llama.cpp's +0.87%; decode 1.44–1.63× ahead in two clean runs (10/12 and 12/12 paired reps) |
 
 Each phase is verified against a reference implementation before the next one
 starts. Correctness first; a fast wrong answer teaches nothing.
@@ -388,9 +388,10 @@ The int8 projections are now wired into the forward pass — see
 [phase 7, finished](#phase-7-finished--int8-in-the-forward-pass) after phase 8,
 which is what made it worth doing.
 
-**WebGPU is started** — see [the GPU half](#phase-7-the-gpu-half--started):
-the int8 kernel is written as a compute shader and verified against the CPU
-kernel, but has not yet run on a real GPU or been wired into the engine.
+**WebGPU was measured and rejected** — see
+[the GPU half](#phase-7-the-gpu-half--measured-and-rejected): the int8 kernel is
+a verified compute shader, and on this laptop's Iris Xe it is slower than the
+CPU kernel on every shape, so it is not wired into the engine.
 
 ### Phase 8 — llama.cpp as a reference
 
@@ -466,7 +467,180 @@ finishing that would be worth. (They are now — see
 
 **llama.cpp wins prefill outright, 2–3×** (22–45 ms/token against 69–77). Prefill
 is a compute-bound matmul over the whole prompt, which is the regime where better
-kernels do pay.
+kernels do pay. (No longer true either — see below.)
+
+### Where it landed: plain int8, not VNNI
+
+Every decode number above is superseded, and so is the conclusion the first
+draft of this section drew. Twelve reps, five engines alternating inside each
+rep, each at its own best thread count; the cleanest run recorded, with
+llama.cpp 1.06× off its best ever:
+
+| engine | threads | prefill ms/tok | decode ms/tok | decode tok/s |
+|---|---:|---:|---:|---:|
+| nanoinfer f32 | 6 | 25.61 | 67.19 | 14.88 |
+| **nanoinfer int8** | 4 | 9.27 | **23.90** | **41.84** |
+| nanoinfer int8 + VNNI | 4 | **8.61** | 24.86 | 40.23 |
+| llama.cpp f32 | 3 | 15.19 | 74.32 | 13.46 |
+| llama.cpp Q8_0 | 1 | 14.52 | 34.37 | 29.10 |
+
+**Quality: int8 costs less than llama.cpp, and this part is settled.**
+Perplexity on the same 2944 held-out tokens, each engine against **its own** f32
+baseline because the two harnesses window the text differently and disagree on
+absolutes. Perplexity is deterministic, so unlike the timings these figures do
+not move with machine load:
+
+| | f32 | quantized | cost |
+|---|---:|---:|---:|
+| llama.cpp Q8_0 | | | **+0.87%** |
+| **nanoinfer int8, f32 activations, f32 embeddings** | 23.6851 | 23.7164 | **+0.13%** |
+| nanoinfer int8, f32 activations, int8 embeddings | 23.6851 | 23.7595 | +0.31% |
+| nanoinfer int8 + VNNI, scale per 32, LM head f32 | 23.6851 | 23.8286 | +0.61% |
+
+The gap is mostly structural. llama.cpp's Q8_0 kernel quantizes activations to
+8 bits so it can use integer dot products; nanoinfer's default path keeps them
+in f32 and quantizes only the weights. The VNNI path makes the same trade as
+llama.cpp and lands between the two.
+
+**Speed: int8 decodes faster, on an idle machine.** Every run since the
+thread-pool fix, decode only, int8 against llama.cpp Q8_0:
+
+| run | control (llama.cpp vs best ever) | int8 lead on minima | paired wins | sign test p |
+|---|---:|---:|---:|---:|
+| 1 | 1.16× — ok | 1.63× | 10 / 12 | 0.019 |
+| 2 | 1.50× — **failed** | 0.89× (llama.cpp ahead) | 4 / 12 | 0.93 |
+| 3 | 1.06× — ok | 1.44× | **12 / 12** | 0.0002 |
+
+Both clean runs pass on their own, and in the second every rep favoured int8 —
+the worst by 1.09×. The decision rule was fixed before run 3 was taken, which is
+what makes it a confirmation rather than a search.
+
+Run 2 is reported because it is the honest limit on the claim. It was taken
+with the battery at 19% and charging, and the slowdown was lopsided: int8 went
+from 23 to 55 ms/token, 2.4×, while llama.cpp went 1.3×. A matvec split across
+four cores loses more to a throttled or busy CPU than one pinned to a single
+core does. So the lead is real on an idle, cool laptop and does not survive
+contention — which is a property of the engine, not just of the measurement.
+
+```sh
+OPENBLAS_NUM_THREADS=6 python -m tools.bench_llamacpp --llama-cpp ../llama.cpp --reps 12
+```
+
+Prefill is the other way round from earlier phases: on minima nanoinfer now
+leads it too, with VNNI fastest there — though the paired test was only run on
+decode, so that is a reading, not a claim. Prefill is a matrix-matrix product, compute-bound
+rather than memory-bound, which is exactly where 32-bytes-per-instruction pays.
+
+**What changed between "llama.cpp wins 1.65×" and this:** the Rust thread pool.
+Rayon sizes its global pool to every logical CPU — 20 here, 6 fast cores and
+8 slow ones — and splitting a memory-bound matvec evenly across them leaves the
+fast cores waiting on the slow ones. The same trap phase 8 caught llama.cpp in
+with `-t 20`, sprung on this engine instead. A sweep put both int8 kernels best
+at four threads; `nanoinfer_set_threads` now sizes the pool at load, and
+`NANOINFER_THREADS` overrides it.
+
+An earlier draft of this section reported a 12-of-12 sweep for VNNI at 32.45
+ms/token. That was real, but it was the per-row activation scale, which costs
++3.03% perplexity, and it predates the thread-pool fix. It does not describe
+anything in the tree now.
+
+### Why one scale per row was the wrong granularity
+
+It is phase 6's per-tensor-versus-per-channel argument arriving on the
+activation side, at worse granularity than the case that argument was first
+made about. Measured on the real model, one decode step's activations:
+
+| width | max/median \|x\| | per-row error | per-32 error |
+|---:|---:|---:|---:|
+| 896 | 28.9× | 2.53% | 0.96% |
+| 4864 | **68.3×** | 4.97% | 0.90% |
+
+The largest element in a 4864-wide activation vector is 68× the median, so a
+per-row scale is set by that one value and the other 4863 share a range 68×
+too wide. Blocking confines each outlier to its own 32 values. The perplexity
+curve flattens there — one per 128 costs +1.37%, one per 32 costs +0.85%, one
+per 16 also +0.85% — which is presumably why llama.cpp's Q8_0 and Q8_1 both use
+32. Overhead is one f32 per 32 bytes of activation, and activations are not what
+streams from DRAM.
+
+### Two things that were worth more than the kernel
+
+The first blocked version was *slower* than the per-row kernel it replaced, and
+neither cause was the arithmetic.
+
+**It allocated three `Vec`s per call.** The blocked matmul runs 97 times per
+decoded token, so that was ~300 allocations a token, and it showed as a 4.37×
+spread. Activations are now quantized once into flat buffers.
+
+**Both VNNI matmuls were single-threaded.** The float-activation path they were
+measured against uses rayon. So every VNNI number recorded before that fix —
+32.45 ms/token, the 2.2–2.6× per-shape gains, the 12-of-12 sweep — was **one
+core against six**, which makes the instruction-level win larger than it looked
+rather than smaller. Rows are independent, so they now split the way
+`matmul_i8_parallel` splits them.
+
+### Why the earlier kernel was leaving it on the table
+
+Profiling decode on the real model put **76.6%** of the time inside the int8
+kernel — 97 calls per token, with attention, the norms, RoPE and softmax
+together under 10%. Python was never the problem. The kernel ran at **6.4 GB/s
+against this machine's ~24**, which says compute-bound on *converting* int8 to
+float rather than waiting for memory: it widened eight bytes at a time with
+`_mm256_cvtepi8_epi32` and did the dot product in floating point.
+
+This CPU reports `avxvnni`. VPDPBUSD takes **thirty-two bytes per instruction**
+and accumulates in i32, with no conversion in the inner loop — 2.2–2.6× on the
+per-layer projections, 1.39× on the LM head, which at 136M weights is the one
+shape genuinely memory-bound rather than instruction-bound. That spread across
+shapes is the diagnosis confirming itself.
+
+It also explains how llama.cpp was winning while pinned to `-t 1`: its Q8_0
+kernels use the same instruction, so this was never a parallelism gap.
+
+The sign handling is the fiddly part. VPDPBUSD multiplies *unsigned* by
+*signed*, and the cheap way to satisfy that is to offset the weights rather than
+the activations — `XOR 0x80` reads `i8` as `u8` in order, adding 128 to each:
+
+```
+dpbusd(w ^ 0x80, xq) = Σ(w·xq) + 128·Σxq
+```
+
+so the correction is **one scalar per call**, because the activation vector is
+shared by every row. Offsetting the activations instead would have needed
+`128·Σw` — a different value per row, and a second pass over the weights to get
+it.
+
+It is **off by default**, because it is not free: VPDPBUSD needs both operands
+as bytes, so activations carry 8 bits where they carried 32 — +0.85%
+perplexity against an fp32 baseline, where the float-activation path costs
++0.19%. `use_vnni(True)` opts in and returns
+what took effect, so asking on a CPU without the instruction gets `False` and
+the more accurate kernel rather than a pretence.
+
+### The gate that got this wrong twice
+
+The first version of this comparison had llama.cpp 1.8–2.6× **ahead**. That was
+two numbers from different runs on different days — mine at its best against
+llama.cpp's from phase 8. Measured in one process, alternating, llama.cpp came
+in at 66 rather than 85 and the apparent margin evaporated. The same error as
+phase 4's 15× cliff, reintroduced.
+
+The fix after that was also wrong. Gating on `max/min` spread looks prudent and
+is unusable: it can only grow as reps are added, so more evidence makes a lead
+look *less* certain. Eight reps reported spreads of 1.4–2.2×; twenty reported
+4.6–8.6×. Same machine, same code.
+
+What works is the paired test. The contenders already alternate inside each rep,
+so every rep is a matched pair under shared conditions, and counting wins is a
+sign test — robust to exactly the stalls that move the absolute numbers around.
+
+It is not robust to stalls that hit one contender harder than the other, and
+that is how it got this wrong a third time. On a loaded laptop this engine
+slowed 1.3× while llama.cpp slowed 3.7×, so every rep favoured this engine and
+the test reported a clean sweep on a measurement worth nothing. The fix is a
+control: llama.cpp's code never changes between runs, so its own number is a
+thermometer for the machine, and a run where it reads more than 1.5× off its
+best ever is flagged as not comparable whatever the sign test says.
 
 ### Handing your opponent a bad flag is not a benchmark
 
@@ -674,7 +848,7 @@ and joins them again, and K and V were 128 rows each — 32 rows per thread on
 four cores, almost nothing but the wakeup and the join. Prefill moves the same
 weights and does the same arithmetic either way, and does not change.
 
-### Phase 7, the GPU half — started
+### Phase 7, the GPU half — measured and rejected
 
 The int8 matmul now exists as a WebGPU compute shader, in its own crate,
 `gpu/`. The CPU crate keeps its one dependency and its seconds-long build;
@@ -706,25 +880,37 @@ submission, each writing its own rows of the shared output. Both have tests:
 70,000 rows for the wrap, and a matrix forced into seven uneven chunks that
 must match the same matrix uploaded whole.
 
-**What is not known yet: how fast it is.** There is no GPU where this was
-built. The tests and the benchmark ran on llvmpipe, Mesa's software Vulkan
-driver, which executes the shader on the CPU — right for checking the
-arithmetic, meaningless for timing it, and the benchmark prints a warning
-rather than a number when it detects one. The real measurement is on the
-Iris Xe:
+**How fast it is: slower than the CPU, everywhere.** The tests were first run
+on llvmpipe, Mesa's software Vulkan driver, which is right for checking the
+arithmetic and meaningless for timing it. On the Iris Xe all six pass, and the
+benchmark says:
 
 ```
 cd gpu && cargo test --release && cargo run --release --example bench
 ```
 
-Two things that will matter there, stated now so the result can be read
-against them. Iris Xe is integrated: it shares DRAM with the CPU, so its
-bandwidth for the weights is the same ~24 GB/s the CPU sees, and the win, if
-there is one, is in arithmetic and in freeing the CPU, not in bytes. And each
-call is a round trip — upload, dispatch, map, read back — whose fixed cost
-the benchmark includes; decode makes 97 such calls a token, so the next step
-after timing is to keep the activations on the GPU between layers rather than
-crossing the boundary for every projection.
+| shape | cpu ms | gpu ms | gpu / cpu |
+|---|---:|---:|---:|
+| q_proj 896×896 | 0.047 | 0.574 | 12.13× |
+| kv_proj 128×896 | 0.007 | 0.523 | 76.87× |
+| o_proj 896×896 | 0.126 | 0.643 | 5.10× |
+| gate 4864×896 | 0.172 | 0.965 | 5.63× |
+| down 896×4864 | 0.165 | 0.755 | 4.58× |
+| lm_head 151936×896 | 4.612 | 6.805 | 1.48× |
+
+The shape of that table is the diagnosis. The GPU column barely moves from
+128 rows to 4864 — about half a millisecond either way — so it is measuring the
+round trip, not the work: upload, dispatch, map, read back, every call. The
+smaller the matrix, the worse the ratio, and the one shape big enough to
+amortise it, the LM head, still loses by 1.48×. That is the integrated-GPU
+argument made concrete: the Iris Xe reads the same DRAM at the same ~24 GB/s
+the CPU does, so there are no bytes to win back, and for a memory-bound matvec
+bytes are the whole game.
+
+Keeping activations resident on the GPU between layers would remove most of
+the per-call cost. It would not change the bandwidth ceiling, and decode at
+this model size is already within reach of that ceiling on the CPU — so the
+kernel stays in the tree, tested, and out of the forward pass.
 
 ## Parameter budget
 

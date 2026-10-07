@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import re
@@ -55,8 +56,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from nanoinfer import kernels  # noqa: E402
 from nanoinfer.generate import greedy  # noqa: E402
 from nanoinfer.model import Qwen2  # noqa: E402
+from nanoinfer.quantization import quantize_model  # noqa: E402
 from nanoinfer.tokenizer import Tokenizer  # noqa: E402
 from nanoinfer.weights import ModelWeights  # noqa: E402
 
@@ -132,25 +135,57 @@ def main(argv: list[str] | None = None) -> int:
     tokenizer = Tokenizer.from_model_dir(args.model)
     prompt_ids = list(tokenizer.encode(PROMPT))
     print("loading weights...", flush=True)
-    model = Qwen2(ModelWeights.load(args.model))
+    fp32_weights = ModelWeights.load(args.model)
+    model = Qwen2(fp32_weights)
 
-    # Minimum ms-per-token seen, which is the cleanest read on the code.
-    best: dict[str, dict[str, float]] = {}
+    # The int8 engine belongs in this comparison, not in a separate tool. It is
+    # what llama.cpp's Q8_0 should be measured against -- both hold integer
+    # weights and read a quarter of the bytes -- and comparing numbers taken
+    # from two different runs on two different days is how a 2.3x spread gets
+    # mistaken for a 1.1x win.
+    int8_weights, _ = quantize_model(fp32_weights, bits=8, dequantize=False)
+    int8_model = Qwen2(int8_weights)
+
+    # Every observation, so the spread is visible. A minimum alone cannot say
+    # whether it is the floor of a tight distribution or the lucky end of a
+    # wide one, and that distinction is the whole question here.
+    seen: dict[str, dict[str, list[float]]] = {}
 
     def record(name: str, prefill_ms: float, prefill_n: int, decode_ms: float, decode_n: int):
-        slot = best.setdefault(name, {"prefill": float("inf"), "decode": float("inf")})
-        slot["prefill"] = min(slot["prefill"], prefill_ms / max(prefill_n, 1))
-        slot["decode"] = min(slot["decode"], decode_ms / max(decode_n, 1))
+        slot = seen.setdefault(name, {"prefill": [], "decode": []})
+        slot["prefill"].append(prefill_ms / max(prefill_n, 1))
+        slot["decode"].append(decode_ms / max(decode_n, 1))
 
-    print(f"alternating {args.reps} reps, {args.tokens} tokens each\n")
-    for rep in range(args.reps):
-        result = greedy(model, prompt_ids, max_new_tokens=args.tokens)
+    def record_engine(name: str, engine: Qwen2, vnni: bool = False):
+        # The VNNI kernel is global state in the bridge, so it is turned on
+        # only around its own timing and off again immediately -- otherwise
+        # whichever contender ran next would silently inherit it.
+        if vnni and not kernels.use_vnni(True):
+            raise RuntimeError("asked for VNNI, but this CPU has none")
+        try:
+            result = greedy(engine, prompt_ids, max_new_tokens=args.tokens)
+        finally:
+            kernels.use_vnni(False)
         generated = len(result.generated_ids)
         record(
-            "nanoinfer f32",
+            name,
             result.prefill_s * 1e3, len(prompt_ids),
             result.decode_s * 1e3, max(generated - 1, 1),
         )
+
+    # Warm up at the measured size before timing anything, so no contender
+    # pays thread-pool spin-up inside a timed rep.
+    for engine in (model, int8_model):
+        greedy(engine, prompt_ids, max_new_tokens=2)
+    for name, gguf, threads in contenders:
+        llama_run(completion, gguf, PROMPT, 2, threads)
+
+    print(f"alternating {args.reps} reps, {args.tokens} tokens each\n")
+    for rep in range(args.reps):
+        record_engine("nanoinfer f32", model)
+        record_engine("nanoinfer int8", int8_model)
+        if kernels.vnni_available():
+            record_engine("nanoinfer vnni", int8_model, vnni=True)
         for name, gguf, threads in contenders:
             timing = llama_run(completion, gguf, PROMPT, args.tokens, threads)
             record(
@@ -160,28 +195,118 @@ def main(argv: list[str] | None = None) -> int:
             )
         print(f"  rep {rep + 1}/{args.reps} done", flush=True)
 
+    best = {
+        name: {phase: min(values) for phase, values in phases.items()}
+        for name, phases in seen.items()
+    }
+
     print(f"\n{platform.processor() or platform.machine()}")
     print(
         f"\n{'engine':<18} {'threads':>8} {'prefill ms/tok':>15} "
-        f"{'decode ms/tok':>14} {'decode tok/s':>13}"
+        f"{'decode ms/tok':>14} {'spread':>8} {'decode tok/s':>13}"
     )
-    print("-" * 73)
-    baseline = best["nanoinfer f32"]["decode"]
-    rows = [("nanoinfer f32", str(blas_threads))]
+    print("-" * 82)
+    # The int8 rows run on the Rust pool, not OpenBLAS, so they report its
+    # size: that setting moved decode by 1.69x on its own.
+    rust_threads = str(kernels.describe()["threads"])
+    rows = [("nanoinfer f32", str(blas_threads)),
+            ("nanoinfer int8", rust_threads)]
+    if kernels.vnni_available():
+        rows.append(("nanoinfer vnni", rust_threads))
     rows += [(name, str(threads)) for name, _, threads in contenders]
+    spreads = {}
     for name, threads in rows:
         slot = best[name]
+        observed = seen[name]["decode"]
+        spreads[name] = max(observed) / min(observed)
         print(
             f"{name:<18} {threads:>8} {slot['prefill']:>15.2f} "
-            f"{slot['decode']:>14.2f} {1e3 / slot['decode']:>13.2f}"
+            f"{slot['decode']:>14.2f} {spreads[name]:>7.2f}x "
+            f"{1e3 / slot['decode']:>13.2f}"
         )
-    print("-" * 73)
-    for name, _, _ in contenders:
-        ratio = baseline / best[name]["decode"]
-        if ratio >= 1:
-            print(f"{name} decodes {ratio:.2f}x faster than nanoinfer")
-        else:
-            print(f"{name} decodes {1 / ratio:.2f}x SLOWER than nanoinfer")
+    print("-" * 82)
+
+    # The comparison this tool exists for, stated only as strongly as the
+    # measurement supports it.
+    #
+    # Not max/min as the gate, which was the first attempt and is unusable:
+    # it can only grow as reps are added, so more data makes a lead look less
+    # certain rather than more. Twenty reps reported spreads of 4.6-8.6x where
+    # eight reported 1.4-2.2x, on the same machine and the same code.
+    #
+    # The contenders alternate inside each rep, so each rep is a matched pair
+    # measured under the same conditions. Counting how often one wins is
+    # therefore a sign test, and it is robust to exactly the stalls that make
+    # the absolute numbers move around.
+    target = "llama.cpp Q8_0"
+    if target in best:
+        theirs = best[target]["decode"]
+
+        # Control: llama.cpp's code does not change between runs, so its own
+        # number is a thermometer for the machine. A run where it reads far
+        # from the best ever recorded is not comparable to one where it does,
+        # whatever the paired test says.
+        #
+        # This exists because the paired test has a blind spot. It is robust to
+        # noise that hits both contenders equally and blind to noise that does
+        # not: on a loaded laptop this engine slowed by 1.3x while llama.cpp
+        # slowed by 3.7x, so every rep favoured this engine and the test
+        # reported a clean 8/8 sweep on a measurement worth nothing.
+        history = []
+        if args.out.exists():
+            for line in args.out.read_text(encoding="utf-8").splitlines():
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                for row in record.get("rows") or []:
+                    if row.get("engine") == target and row.get("decode_ms"):
+                        history.append(row["decode_ms"])
+        reference = min(history, default=None)
+        if reference is not None:
+            drift = theirs / reference
+            state = "CONTROL FAILED" if drift > 1.5 else "control ok"
+            print(f"{state}: {target} read {theirs:.2f} ms/tok against a "
+                  f"best-ever {reference:.2f} ({drift:.2f}x).")
+            if drift > 1.5:
+                print("  Its code has not changed, so the machine has. The "
+                      "verdicts below are not comparable to earlier runs.")
+
+        # Every int8 configuration of this engine, not just one. With the
+        # thread pool sized properly the plain float-activation path came out
+        # ahead of VNNI, so testing only VNNI would have hidden the faster --
+        # and more accurate -- of the two.
+        for mine in ("nanoinfer int8", "nanoinfer vnni"):
+            if mine not in best:
+                continue
+            ours = best[mine]["decode"]
+            margin = theirs / ours if ours < theirs else ours / theirs
+            leader = mine if ours < theirs else target
+            pairs = list(zip(seen[mine]["decode"], seen[target]["decode"]))
+            wins = sum(1 for a, b in pairs if a < b)
+            ratios = sorted(b / a for a, b in pairs)
+            print()
+            print(f"{mine} {ours:.2f} ms/tok against {target} {theirs:.2f}")
+            print(f"  minima: {leader} leads by {margin:.2f}x")
+            print(f"  paired: {mine} faster in {wins}/{len(pairs)} reps, "
+                  f"per-rep ratio {ratios[0]:.2f}x to {ratios[-1]:.2f}x")
+            # Exact one-sided sign test: the chance of winning at least this
+            # many reps if the two engines were really the same speed and each
+            # rep were a coin flip. This replaced an earlier rule that demanded
+            # a clean sweep, which is stricter than any conventional threshold
+            # (10 of 12 is p = 0.019) and was changed before the run it would
+            # be used to judge, not after.
+            n = len(pairs)
+            p = sum(math.comb(n, k) for k in range(wins, n + 1)) / 2 ** n
+            print(f"  sign test: p = {p:.2g} that {wins}/{n} or better is chance")
+            if p < 0.05:
+                print(f"  {mine} is faster at p < 0.05 -- this run supports "
+                      f"the claim. One run is one run; it needs to repeat.")
+            elif wins > n * 0.5:
+                print(f"  {mine} wins most reps but p >= 0.05 -- suggestive, "
+                      f"not settled.")
+            else:
+                print(f"  {target} wins most reps -- no claim for {mine} here.")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("a", encoding="utf-8") as fh:
@@ -194,6 +319,11 @@ def main(argv: list[str] | None = None) -> int:
                     "llama_threads_q8": args.threads_q8,
                     "nanoinfer_blas_threads": blas_threads,
                     "ms_per_token": best,
+                    "rows": [
+                        {"engine": engine, "decode_ms": best[engine]["decode"],
+                         "prefill_ms": best[engine]["prefill"]}
+                        for engine in best
+                    ],
                 }
             )
             + "\n"

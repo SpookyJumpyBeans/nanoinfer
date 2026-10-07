@@ -143,7 +143,13 @@ def main(argv: list[str] | None = None) -> int:
     weights = synthetic_weights() if args.synthetic else ModelWeights.load(args.model)
     print(f"loaded in {time.perf_counter() - started:.1f}s", file=sys.stderr)
 
-    int8, _ = quantize_model(weights, bits=8, dequantize=False)
+    # Explicit, not defaulted. quantize_embeddings became True by default once
+    # the measurements justified it, and this row exists to measure the
+    # linear-only case against it -- inheriting the default silently turned the
+    # two contenders into the same model, both reporting 0.50 GB.
+    int8, _ = quantize_model(
+        weights, bits=8, quantize_embeddings=False, dequantize=False
+    )
     int8_embed, _ = quantize_model(weights, bits=8, quantize_embeddings=True, dequantize=False)
     contenders = {
         "fp32": Qwen2(weights),
@@ -155,8 +161,13 @@ def main(argv: list[str] | None = None) -> int:
     rng = np.random.default_rng(1)
     prompt = rng.integers(0, weights.config.vocab_size, args.prompt_tokens)
 
-    for model in contenders.values():                 # warm up, page in
-        time_one(model, prompt[:4], 2)
+    # Warm up at the measured prompt length, not a short one. A 4-token
+    # prefill is a small enough GEMM that OpenBLAS need not take its threaded
+    # path, so warming up on one left the first real prefill paying thread-pool
+    # spin-up: fp32 prefill was reported anywhere between 26 and 382 ms/token
+    # for the same configuration, a 14x spread on one number.
+    for model in contenders.values():
+        time_one(model, prompt, 2)
 
     prefill = {name: [] for name in contenders}
     decode = {name: [] for name in contenders}
@@ -166,15 +177,28 @@ def main(argv: list[str] | None = None) -> int:
             prefill[name].append(p)
             decode[name].extend(d)
 
-    base = statistics.median(decode["fp32"])
-    print(f"\n{'':<12} {'weights':>9} {'decode ms/tok':>14} {'vs fp32':>8} "
-          f"{'prefill ms/tok':>15}")
+    # Minimum for decode too, not the median it used to be. The median of a
+    # contended run tracks the background load: five runs of this benchmark
+    # put int8+embed between 58.6 and 126.1 ms/token, a 2.15x swing on one
+    # configuration, and three of them clustered tightly enough to look like a
+    # result. The fastest observation is the one least polluted by the
+    # machine, which is the same reasoning phases 4, 7 and 8 all landed on.
+    base = min(decode["fp32"])
+    print(f"\n{'':<12} {'weights':>9} {'decode ms/tok':>9} {'spread':>8} "
+          f"{'vs fp32':>8} {'prefill ms/tok':>15} {'spread':>8}")
     rows = []
+    unstable: list[tuple[str, str, float]] = []
     for name in contenders:
-        step = statistics.median(decode[name])
-        pre = statistics.median(prefill[name]) / args.prompt_tokens
-        print(f"{name:<12} {footprint[name] / 1e9:>7.2f}GB {step * 1e3:>14.2f} "
-              f"{base / step:>7.2f}x {pre * 1e3:>15.2f}")
+        # Minimum, not median, for both phases: a stall is the machine, and the
+        # fastest observation is the one least contaminated by it. Phases 4, 7
+        # and 8 all report minima for the same reason.
+        step = min(decode[name])
+        step_spread = max(decode[name]) / min(decode[name])
+        pre = min(prefill[name]) / args.prompt_tokens
+        spread = max(prefill[name]) / min(prefill[name])
+        print(f"{name:<12} {footprint[name] / 1e9:>7.2f}GB {step * 1e3:>9.2f} "
+              f"{step_spread:>7.2f}x {base / step:>7.2f}x {pre * 1e3:>15.2f} "
+              f"{spread:>7.2f}x")
         rows.append({
             "contender": name,
             "weights_bytes": footprint[name],
@@ -182,7 +206,21 @@ def main(argv: list[str] | None = None) -> int:
             "decode_p10_ms": float(np.percentile(decode[name], 10)) * 1e3,
             "decode_p90_ms": float(np.percentile(decode[name], 90)) * 1e3,
             "prefill_ms_per_token": pre * 1e3,
+            "prefill_spread": spread,
+            "decode_spread": step_spread,
         })
+        if spread > 1.5:
+            unstable.append((name, "prefill", spread))
+        if step_spread > 1.5:
+            unstable.append((name, "decode", step_spread))
+
+    if unstable:
+        print(file=sys.stderr)
+        for name, phase, observed in unstable:
+            print(f"warning: {name} {phase} varied {observed:.1f}x across "
+                  f"{args.rounds} rounds; treat it as unmeasured, not as a "
+                  f"result. Raise --rounds or quiet the machine.",
+                  file=sys.stderr)
 
     if args.dry_run:
         return 0

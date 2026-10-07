@@ -28,6 +28,10 @@ import numpy as np
 
 _LIBRARY_STEM = "nanoinfer_kernels"
 
+# Worker threads for the Rust kernels, unless NANOINFER_THREADS says
+# otherwise. See the comment where the pool is sized in _load().
+DEFAULT_THREADS = 4
+
 
 def _candidate_paths() -> list[Path]:
     """Where a built library might be, most specific first."""
@@ -76,13 +80,33 @@ def _load() -> ctypes.CDLL | None:
         # typed pointers. Building a POINTER object per array with data_as()
         # was ~40% of an otherwise empty call -- 169 calls a token, ~3 ms --
         # and the typing it buys is already enforced by _as_kernel_input.
-        library.nanoinfer_matmul_i8.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 3
-        library.nanoinfer_matmul_i8.restype = None
+        for symbol in ("nanoinfer_matmul_i8", "nanoinfer_matmul_i8_vnni"):
+            function = getattr(library, symbol)
+            function.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 3
+            function.restype = None
+        library.nanoinfer_matmul_i8_vnni_blocked.argtypes = (
+            [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 4
+        )
+        library.nanoinfer_matmul_i8_vnni_blocked.restype = None
 
         library.nanoinfer_has_avx2.argtypes = []
         library.nanoinfer_has_avx2.restype = ctypes.c_int
+        library.nanoinfer_has_vnni.argtypes = []
+        library.nanoinfer_has_vnni.restype = ctypes.c_int
         library.nanoinfer_num_threads.argtypes = []
         library.nanoinfer_num_threads.restype = ctypes.c_int
+        library.nanoinfer_set_threads.argtypes = [ctypes.c_size_t]
+        library.nanoinfer_set_threads.restype = ctypes.c_int
+
+        # Size the worker pool before anything can touch it. Rayon builds its
+        # global pool once, on first use, at one worker per logical CPU -- 20
+        # here, and the slowest setting measured: the even row split leaves the
+        # six P-cores waiting on the eight E-cores, 97 times per token. Four
+        # was fastest in a sweep on the real model (32.77 ms/token against
+        # 55.42 at 20). NANOINFER_THREADS overrides it, since the best count
+        # is a property of the machine, not of the code.
+        requested = int(os.environ.get("NANOINFER_THREADS", DEFAULT_THREADS))
+        library.nanoinfer_set_threads(requested)
         return library
     return None
 
@@ -172,7 +196,12 @@ def matvec_i8(
     return out
 
 
-def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.ndarray:
+def matmul_i8(
+    quantized: np.ndarray,
+    scales: np.ndarray,
+    x: np.ndarray,
+    allow_vnni: bool = True,
+) -> np.ndarray:
     """``x @ (quantized * scales[:, None]).T`` for a batch of tokens, in Rust.
 
     ``x`` is ``[tokens, in_features]`` and the result ``[tokens,
@@ -211,7 +240,26 @@ def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.nd
     # Rust writes [out_features, tokens] so that each worker's rows are one
     # contiguous block; the transpose back is a view, not a copy.
     out_t = np.empty((out_features, tokens), dtype=np.float32)
-    _LIBRARY.nanoinfer_matmul_i8(
+    use_vnni_here = _USE_VNNI and allow_vnni
+    if use_vnni_here and _VNNI_BLOCK:
+        _LIBRARY.nanoinfer_matmul_i8_vnni_blocked(
+            quantized.ctypes.data,
+            scales.ctypes.data,
+            x.ctypes.data,
+            out_t.ctypes.data,
+            out_features,
+            in_features,
+            tokens,
+            _VNNI_BLOCK,
+        )
+        return out_t.T
+
+    entry = (
+        _LIBRARY.nanoinfer_matmul_i8_vnni
+        if use_vnni_here
+        else _LIBRARY.nanoinfer_matmul_i8
+    )
+    entry(
         quantized.ctypes.data,
         scales.ctypes.data,
         x.ctypes.data,
@@ -221,6 +269,71 @@ def matmul_i8(quantized: np.ndarray, scales: np.ndarray, x: np.ndarray) -> np.nd
         tokens,
     )
     return out_t.T
+
+
+# Off by default, and deliberately not a silent upgrade. The VNNI kernel
+# quantizes activations to int8 so VPDPBUSD can take them, which costs about
+# one part in a hundred against the float-activation path. Leaving it off keeps
+# the engine bit-comparable with the simulated quantization the perplexity
+# numbers were measured on; this is opted into for timing, and for use once
+# that quality cost has been measured end to end rather than assumed.
+_USE_VNNI = False
+
+# Activation values per scale. 32 is what llama.cpp's Q8_0 and Q8_1 use, and
+# where this model's error stops improving: one scale per row costs +5.42%
+# perplexity against an fp32 baseline, per 128 costs +1.37%, per 32 costs
+# +0.46%, and per 16 measured no better than per 32. Zero means one scale for
+# the whole row, which is what the first VNNI kernel did.
+_VNNI_BLOCK = 32
+
+
+def vnni_available() -> bool:
+    """Whether the loaded library can run the VNNI kernel on this CPU."""
+    return _LIBRARY is not None and bool(_LIBRARY.nanoinfer_has_vnni())
+
+
+# Whether the LM head may use VNNI. Off by default: it is the one projection
+# whose activation error lands straight on the logits with no hidden dimension
+# to average it over, and it is memory-bound at 136M weights, so VNNI buys it
+# only about 1.06x. Keeping it on float activations is close to free in speed
+# and removes the error that matters most.
+_VNNI_LM_HEAD = False
+
+
+def vnni_lm_head(enabled: bool) -> bool:
+    """Let the LM head use VNNI too. Returns what took effect."""
+    global _VNNI_LM_HEAD
+    _VNNI_LM_HEAD = bool(enabled)
+    return _VNNI_LM_HEAD
+
+
+def lm_head_allows_vnni() -> bool:
+    return _VNNI_LM_HEAD
+
+
+def vnni_block(values_per_scale: int) -> int:
+    """Set how many activation values share a scale; returns what took effect.
+
+    Zero or a value at least as wide as a row gives one scale per row, which is
+    measurably worse on this model: these activations run to 28.9x the median on
+    the 896-wide inputs and 68.3x on the 4864-wide ones, so a single scale is
+    set by the outlier and crushes everything beside it.
+    """
+    global _VNNI_BLOCK
+    _VNNI_BLOCK = max(int(values_per_scale), 0)
+    return _VNNI_BLOCK
+
+
+def use_vnni(enabled: bool) -> bool:
+    """Route :func:`matmul_i8` through the VNNI kernel; returns what took effect.
+
+    Asking for it on a CPU without AVX-VNNI leaves it off rather than
+    pretending: the caller gets ``False`` back and keeps the float-activation
+    kernel, which is the more accurate of the two.
+    """
+    global _USE_VNNI
+    _USE_VNNI = bool(enabled) and vnni_available()
+    return _USE_VNNI
 
 
 def matvec_i8_numpy(

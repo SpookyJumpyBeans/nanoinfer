@@ -32,6 +32,7 @@ import numpy as np
 from nanoinfer.attention import self_attention
 from nanoinfer.config import ModelConfig
 from nanoinfer.kvcache import KVCache
+from nanoinfer import kernels
 from nanoinfer.linear import gather_rows, linear, linear_many
 from nanoinfer.ops import rms_norm, silu
 from nanoinfer.rope import RotaryEmbedding
@@ -185,7 +186,14 @@ class Qwen2:
             hidden = hidden[-1:]
 
         # Tied embeddings: this is embed_tokens again, used transposed.
-        return linear(hidden, self.weights.lm_head)
+        #
+        # Float activations here even when VNNI is on. Every other projection
+        # feeds a residual stream that later layers average over; this one
+        # writes the logits directly, so its activation error is the error that
+        # decides the next token. And at 136M weights it is memory-bound, so
+        # int8 activations buy it almost nothing.
+        return linear(hidden, self.weights.lm_head,
+                      allow_vnni=kernels.lm_head_allows_vnni())
 
     def next_token_logits(
         self, token_ids: np.ndarray, cache: KVCache | None = None

@@ -243,8 +243,9 @@ def test_quantize_model_leaves_norms_and_biases_alone():
     original = ModelWeights.load(MODEL_DIR)
     quantized, report = quantize_model(original, bits=8)
 
-    # 24 layers x 7 linear tensors.
-    assert report.tensors == 24 * 7
+    # 24 layers x 7 linear tensors, plus the embedding matrix, which is
+    # quantized by default now that the measurements justified it.
+    assert report.tensors == 24 * 7 + 1
     np.testing.assert_array_equal(
         quantized.layers[0].input_layernorm, original.layers[0].input_layernorm
     )
@@ -255,12 +256,33 @@ def test_quantize_model_leaves_norms_and_biases_alone():
 
 @pytest.mark.skipif(not HAVE_MODEL, reason="model not downloaded")
 @pytest.mark.slow
-def test_quantize_model_leaves_embeddings_alone_by_default():
+def test_quantize_model_quantizes_embeddings_by_default():
+    """The default changed, and the reason was measured rather than assumed.
+
+    It used to leave embeddings alone, on the argument that the matrix doubles
+    as the output projection so its errors land straight on the logits. Phase 6
+    priced that caution at 0.02 percentage points of perplexity for 0.41 GB,
+    and phase 7's kernels made those bytes the dominant term in decode time.
+    """
     from nanoinfer.quantization import quantize_model
     from nanoinfer.weights import ModelWeights
 
     original = ModelWeights.load(MODEL_DIR)
     quantized, report = quantize_model(original, bits=8)
+
+    assert report.embeddings_quantized
+    assert not np.array_equal(quantized.embed_tokens, original.embed_tokens)
+
+
+@pytest.mark.skipif(not HAVE_MODEL, reason="model not downloaded")
+@pytest.mark.slow
+def test_quantize_model_can_still_leave_embeddings_alone():
+    """The flag outlives the default change, so the cost stays measurable."""
+    from nanoinfer.quantization import quantize_model
+    from nanoinfer.weights import ModelWeights
+
+    original = ModelWeights.load(MODEL_DIR)
+    quantized, report = quantize_model(original, bits=8, quantize_embeddings=False)
 
     assert not report.embeddings_quantized
     np.testing.assert_array_equal(quantized.embed_tokens, original.embed_tokens)

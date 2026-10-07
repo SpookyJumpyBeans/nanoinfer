@@ -5,8 +5,9 @@
     python -m tools.generate --prompt "The capital of France is" --int8
 
 ``--int8`` holds every linear projection as int8 and runs it through the Rust
-kernel; ``--int8 --int8-embeddings`` also quantizes the embedding matrix, which
-doubles as the LM head and is the single largest read in a decode step.
+kernel, and quantizes the embedding matrix too -- it doubles as the LM head and
+is the single largest read in a decode step. ``--int8 --no-int8-embeddings``
+keeps that matrix at fp32, which is what the flag used to do by default.
 
 ``--chat`` wraps the prompt in the ChatML layout the Instruct model was tuned
 on. Without it the model is a plain text continuer, which is a genuinely
@@ -51,11 +52,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="disable the KV cache; much slower, kept for comparison")
     parser.add_argument("--int8", action="store_true",
                         help="hold linear weights as int8 and run them in the Rust kernel")
-    parser.add_argument("--int8-embeddings", action="store_true",
-                        help="with --int8, quantize the embedding matrix / LM head too")
+    # On by default under --int8, matching quantize_model. The embedding
+    # matrix doubles as the LM head and is the largest single read in a decode
+    # step, so leaving it fp32 gives up most of what int8 is for.
+    parser.add_argument("--no-int8-embeddings", dest="int8_embeddings",
+                        action="store_false",
+                        help="with --int8, keep the embedding matrix / LM head at fp32")
     args = parser.parse_args(argv)
-    if args.int8_embeddings and not args.int8:
-        parser.error("--int8-embeddings needs --int8")
+    if not args.int8_embeddings and not args.int8:
+        parser.error("--no-int8-embeddings needs --int8")
 
     print(f"loading {args.model}", file=sys.stderr)
     start = time.perf_counter()
