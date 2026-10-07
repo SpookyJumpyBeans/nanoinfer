@@ -237,16 +237,9 @@ def main(argv: list[str] | None = None) -> int:
     # measured under the same conditions. Counting how often one wins is
     # therefore a sign test, and it is robust to exactly the stalls that make
     # the absolute numbers move around.
-    mine = "nanoinfer vnni" if "nanoinfer vnni" in best else "nanoinfer int8"
-    ours = best[mine]["decode"]
-    noisiest = max(spreads[mine], spreads.get("llama.cpp Q8_0", 1.0))
-    for name, _, _ in contenders:
-        if name != "llama.cpp Q8_0":
-            continue
-        theirs = best[name]["decode"]
-        margin = theirs / ours if ours < theirs else ours / theirs
-        leader = mine if ours < theirs else name
-        print(f"{mine} {ours:.2f} ms/tok against {name} {theirs:.2f} ms/tok")
+    target = "llama.cpp Q8_0"
+    if target in best:
+        theirs = best[target]["decode"]
 
         # Control: llama.cpp's code does not change between runs, so its own
         # number is a thermometer for the machine. A run where it reads far
@@ -266,34 +259,47 @@ def main(argv: list[str] | None = None) -> int:
                 except ValueError:
                     continue
                 for row in record.get("rows") or []:
-                    if row.get("engine") == name and row.get("decode_ms"):
+                    if row.get("engine") == target and row.get("decode_ms"):
                         history.append(row["decode_ms"])
         reference = min(history, default=None)
-        if reference is not None and theirs > reference * 1.5:
-            print(f"  CONTROL FAILED: {name} read {theirs:.2f} ms/tok against a "
-                  f"best-ever {reference:.2f}. Its code has not changed, so this "
-                  f"machine is {theirs / reference:.1f}x off its own baseline. "
-                  f"The verdict below is not comparable to earlier runs.")
+        if reference is not None:
+            drift = theirs / reference
+            state = "CONTROL FAILED" if drift > 1.5 else "control ok"
+            print(f"{state}: {target} read {theirs:.2f} ms/tok against a "
+                  f"best-ever {reference:.2f} ({drift:.2f}x).")
+            if drift > 1.5:
+                print("  Its code has not changed, so the machine has. The "
+                      "verdicts below are not comparable to earlier runs.")
 
-        mine_each = seen[mine]["decode"]
-        theirs_each = seen[name]["decode"]
-        pairs = list(zip(mine_each, theirs_each))
-        wins = sum(1 for a, b in pairs if a < b)
-        ratios = sorted(b / a for a, b in pairs)
-        print(f"  minima: {leader} leads by {margin:.2f}x")
-        print(f"  paired: {mine} faster in {wins}/{len(pairs)} reps, "
-              f"per-rep ratio {ratios[0]:.2f}x to {ratios[-1]:.2f}x")
-        # One-sided sign test at p < 0.05 needs every rep for n <= 5, and
-        # n - 1 of them by about n = 8. Requiring a clean sweep is stricter
-        # than that and needs no table.
-        if wins == len(pairs) and min(ratios) > 1.0:
-            print(f"  every rep agrees and the worst-case rep still favours "
-                  f"{mine} by {ratios[0]:.2f}x -- this one holds.")
-        elif wins > len(pairs) * 0.5:
-            print(f"  {mine} wins most reps but not all; the losing reps mean "
-                  f"this is suggestive, not settled.")
-        else:
-            print(f"  {name} wins most reps -- no claim for {mine} here.")
+        # Every int8 configuration of this engine, not just one. With the
+        # thread pool sized properly the plain float-activation path came out
+        # ahead of VNNI, so testing only VNNI would have hidden the faster --
+        # and more accurate -- of the two.
+        for mine in ("nanoinfer int8", "nanoinfer vnni"):
+            if mine not in best:
+                continue
+            ours = best[mine]["decode"]
+            margin = theirs / ours if ours < theirs else ours / theirs
+            leader = mine if ours < theirs else target
+            pairs = list(zip(seen[mine]["decode"], seen[target]["decode"]))
+            wins = sum(1 for a, b in pairs if a < b)
+            ratios = sorted(b / a for a, b in pairs)
+            print()
+            print(f"{mine} {ours:.2f} ms/tok against {target} {theirs:.2f}")
+            print(f"  minima: {leader} leads by {margin:.2f}x")
+            print(f"  paired: {mine} faster in {wins}/{len(pairs)} reps, "
+                  f"per-rep ratio {ratios[0]:.2f}x to {ratios[-1]:.2f}x")
+            # One-sided sign test at p < 0.05 needs every rep for n <= 5, and
+            # n - 1 of them by about n = 8. Requiring a clean sweep is stricter
+            # than that and needs no table.
+            if wins == len(pairs) and ratios[0] > 1.0:
+                print(f"  every rep agrees and the worst-case rep still favours "
+                      f"{mine} by {ratios[0]:.2f}x -- this one holds.")
+            elif wins > len(pairs) * 0.5:
+                print(f"  {mine} wins most reps but not all; the losing reps "
+                      f"mean this is suggestive, not settled.")
+            else:
+                print(f"  {target} wins most reps -- no claim for {mine} here.")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("a", encoding="utf-8") as fh:
