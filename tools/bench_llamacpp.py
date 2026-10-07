@@ -298,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
             # be used to judge, not after.
             n = len(pairs)
             p = sum(math.comb(n, k) for k in range(wins, n + 1)) / 2 ** n
-            print(f"  sign test: p = {p:.3f} that {wins}/{n} or better is chance")
+            print(f"  sign test: p = {p:.2g} that {wins}/{n} or better is chance")
             if p < 0.05:
                 print(f"  {mine} is faster at p < 0.05 -- this run supports "
                       f"the claim. One run is one run; it needs to repeat.")
