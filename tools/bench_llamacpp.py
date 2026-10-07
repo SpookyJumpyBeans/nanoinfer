@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import re
@@ -289,15 +290,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  minima: {leader} leads by {margin:.2f}x")
             print(f"  paired: {mine} faster in {wins}/{len(pairs)} reps, "
                   f"per-rep ratio {ratios[0]:.2f}x to {ratios[-1]:.2f}x")
-            # One-sided sign test at p < 0.05 needs every rep for n <= 5, and
-            # n - 1 of them by about n = 8. Requiring a clean sweep is stricter
-            # than that and needs no table.
-            if wins == len(pairs) and ratios[0] > 1.0:
-                print(f"  every rep agrees and the worst-case rep still favours "
-                      f"{mine} by {ratios[0]:.2f}x -- this one holds.")
-            elif wins > len(pairs) * 0.5:
-                print(f"  {mine} wins most reps but not all; the losing reps "
-                      f"mean this is suggestive, not settled.")
+            # Exact one-sided sign test: the chance of winning at least this
+            # many reps if the two engines were really the same speed and each
+            # rep were a coin flip. This replaced an earlier rule that demanded
+            # a clean sweep, which is stricter than any conventional threshold
+            # (10 of 12 is p = 0.019) and was changed before the run it would
+            # be used to judge, not after.
+            n = len(pairs)
+            p = sum(math.comb(n, k) for k in range(wins, n + 1)) / 2 ** n
+            print(f"  sign test: p = {p:.3f} that {wins}/{n} or better is chance")
+            if p < 0.05:
+                print(f"  {mine} is faster at p < 0.05 -- this run supports "
+                      f"the claim. One run is one run; it needs to repeat.")
+            elif wins > n * 0.5:
+                print(f"  {mine} wins most reps but p >= 0.05 -- suggestive, "
+                      f"not settled.")
             else:
                 print(f"  {target} wins most reps -- no claim for {mine} here.")
 
