@@ -1,5 +1,9 @@
 # nanoinfer
 
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)
+![WebGPU](https://img.shields.io/badge/WGSL-WebGPU-005A9C)
+
 An LLM inference engine written from scratch, to understand the layer underneath
 the framework.
 
