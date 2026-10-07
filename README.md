@@ -29,7 +29,7 @@ against the uncached path. [More below.](#running-it)
 | 5 | Temperature / top-k / top-p sampling with a seeded RNG | **done** |
 | 6 | INT8 then INT4 quantization, perplexity delta at each level | **done** |
 | 7 | Rust port: CPU SIMD, then WebGPU compute kernels | **CPU done, wired in, AVX-VNNI**; WebGPU measured and rejected |
-| 8 | Benchmark against llama.cpp on identical hardware | **done** — int8 costs +0.13% perplexity to llama.cpp's +0.87%; decode 1.44–1.63× ahead in two clean runs (10/12 and 12/12 paired reps) |
+| 8 | Benchmark against llama.cpp on identical hardware | **done**: int8 costs +0.13% perplexity to llama.cpp's +0.87%; decode 1.44–1.63× ahead in two clean runs (10/12 and 12/12 paired reps) |
 
 Each phase is verified against a reference implementation before the next one
 starts. Correctness first; a fast wrong answer teaches nothing.
@@ -42,7 +42,7 @@ All published numbers come from one machine:
 |---|---|
 | CPU | Intel i7-12700H, 14 cores / 20 threads, AVX2 |
 | RAM | 16 GB |
-| GPU | Intel Iris Xe (integrated) — no CUDA |
+| GPU | Intel Iris Xe (integrated), no CUDA |
 
 No discrete GPU, so phase 7 targets **WebGPU via `wgpu`** rather than CUDA or
 Metal. That keeps the kernel work real and makes the result runnable on any
@@ -57,7 +57,7 @@ phase and never overwritten, so regressions stay visible.
 python -m bench.benchmark --compare
 ```
 
-### Phase 1 — weight loading
+### Phase 1: weight loading
 
 | Metric | Value |
 |---|---|
@@ -69,10 +69,10 @@ python -m bench.benchmark --compare
 | Peak RSS | 1,392 MB |
 
 Mapping the file is effectively free because nothing is read. The six seconds
-are spent paging 942 MiB off disk and doubling it into float32 — which is the
+are spent paging 942 MiB off disk and doubling it into float32, which is the
 cost that phase 6 exists to attack.
 
-### Phase 2 — tokenizer
+### Phase 2: tokenizer
 
 | Metric | Value |
 |---|---|
@@ -86,16 +86,16 @@ cost that phase 6 exists to attack.
 | Peak RSS | 166 MB |
 
 2.2× off a Rust implementation is closer than pure Python has any right to be,
-and it is not cleverness in the merge loop — that loop is a deliberately
+and it is not cleverness in the merge loop; that loop is a deliberately
 obvious O(n²) scan. It is the per-pre-token merge cache: real text repeats the
 same pre-tokens relentlessly, so almost every lookup after the first thousand
 strings is a dict hit.
 
 The corpus averages 1.97 characters per token, which is far below the ~3.5–4 of
-natural English. That is the corpus doing its job — a third of it is random
+natural English. That is the corpus doing its job: a third of it is random
 codepoints, control bytes and punctuation runs, which is where tokenizers break.
 
-### Phase 3 — forward pass
+### Phase 3: forward pass
 
 Correctness, against `transformers` on the real 494M weights:
 
@@ -118,16 +118,16 @@ Speed, with no KV cache at all:
 
 That 0.25 tok/s is not a disappointing result, it is the baseline. Every step
 re-embeds and re-attends over the entire sequence, so the 24th token costs
-noticeably more than the first — the 1.26× above is the quadratic cost becoming
+noticeably more than the first; the 1.26× above is the quadratic cost becoming
 visible over just 24 tokens. Phase 4 exists to delete that.
 
 > **These numbers are superseded.** They are a mean over a single cold run, and
 > phase 4 established that a single run on this machine can be off by an order
 > of magnitude. Re-measured warm, with medians, the same uncached code does
-> 3.46 tok/s -- see phase 4. The row is left here rather than edited, because
+> 3.46 tok/s; see phase 4. The row is left here rather than edited, because
 > the measurement really was taken and the lesson is what it cost.
 
-### Phase 4 — KV cache
+### Phase 4: KV cache
 
 Both paths measured by alternating them in one process, three rounds each, same
 prompt, same 24 generated tokens:
@@ -140,24 +140,24 @@ prompt, same 24 generated tokens:
 | Time to first token | 200 ms | 152 ms |
 | Arithmetic done | 396 positions | **28 positions** |
 
-**Output is identical** — same token IDs, cached and uncached, on all 494M real
+**Output is identical**: same token IDs, cached and uncached, on all 494M real
 parameters across three prompts and every round. Logits agree to 1e-4 rather
 than bitwise: the cache changes the shape of every matmul in the model, BLAS
 sums the same products in a different order, and float addition is not
 associative. Claiming bitwise equality would be claiming something false.
 
-### The speedup is 3.5×, from 14× less arithmetic — and the gap is the point
+### The speedup is 3.5×, from 14× less arithmetic, and the gap is the point
 
 Those two numbers not matching is the most useful thing phase 4 produced.
 
-Decoding one token reads **every weight in the model** — 1.98 GB — to produce a
+Decoding one token reads **every weight in the model** (1.98 GB) to produce a
 single 896-value vector. At 82.9 ms per token that is **24 GB/s effective**,
 which is roughly this laptop's DRAM bandwidth. The decode step is not
 arithmetic-bound, it is bandwidth-bound: the machine spends its time waiting
 for weights, and most of its floating-point capacity sits idle.
 
 So removing 93% of the arithmetic buys only 3.5×, because the arithmetic was
-never the constraint. The uncached path was accidentally efficient — it pushed
+never the constraint. The uncached path was accidentally efficient: it pushed
 17 positions through each matmul instead of one, which is exactly what makes a
 GEMM worth its memory traffic.
 
@@ -170,7 +170,7 @@ Two consequences worth carrying forward:
   reason. This engine is single-stream by design, so it leaves that on the
   table knowingly.
 
-The speedup is asserted in tests as **work**, not wall time — positions pushed
+The speedup is asserted in tests as **work**, not wall time: positions pushed
 through the model, which is exact and deterministic. Timings live in the
 benchmark, where the machine that produced them is recorded alongside.
 
@@ -182,8 +182,8 @@ and a single decode step has been 145× slower than the fastest in the same run.
 
 I misread this at first. A matmul sweep showed a 15× cliff at exactly the
 prompt length in use, which looked like a BLAS threading pathology worth
-writing up. Re-running it twice put the spike at a different size each time —
-there is no pathological size, only a noisy machine. The finding was an
+writing up. Re-running it twice put the spike at a different size each time.
+There is no pathological size, only a noisy machine. The finding was an
 artifact, and two more runs were cheaper than publishing it.
 
 What the benchmark does about it:
@@ -198,7 +198,7 @@ What the benchmark does about it:
   does not mean single-threaded; it means the library chooses, based on the
   machine.
 
-### Phase 5 — sampling
+### Phase 5: sampling
 
 | Check | Result |
 |---|---|
@@ -234,7 +234,7 @@ to attack.
 
 Nucleus sampling is usually described as "sort descending, accumulate, stop when
 the sum reaches p." Implementing it that way and differential-testing against
-the reference produced disagreements — all of them ties landing on opposite
+the reference produced disagreements, all of them ties landing on opposite
 sides of the cut. For 100 equiprobable tokens at p=0.5 the descending sum
 reaches `0.4999997913837433`, a hair under the boundary, so `>= p` keeps one
 more token than the reference's `<= 1 - p` on the ascending sum.
@@ -255,26 +255,26 @@ Worth recording because both were confident and both were wrong:
 - I asserted a trained model emits no exact float ties, and rested a test on it.
   A real forward pass here produces **about 620 exact float32 collisions** among
   its 151,936 logits. They sit in the low-probability tail, so no realistic
-  nucleus boundary falls inside a tied group — but the ties are real.
+  nucleus boundary falls inside a tied group, but the ties are real.
 - Correcting that, I then claimed the 271 untrained embedding rows past the
   tokenizer's vocabulary carry *identical* logits. I had read rounded output.
   They span a band about 6e-3 wide. What actually matters held up: they carry
   under 1e-6 of the probability mass and any truncation removes them, and that
   is now asserted as a number rather than described in prose.
 
-### Phase 6 — quantization
+### Phase 6: quantization
 
 Perplexity on 508 tokens of held-out prose, against an fp32 baseline of 23.2690:
 
 | Level | Footprint | Perplexity | Δ | Weight error |
 |---|---:|---:|---:|---:|
-| fp32 | 1.98 GB | 23.2690 | — | — |
+| fp32 | 1.98 GB | 23.2690 | n/a | n/a |
 | **INT8** | **0.90 GB** | **23.3078** | **+0.17%** | 0.85% |
 | INT8 + embeddings | **0.50 GB** | 23.3133 | +0.19% | 0.85% |
 | INT4, group 32 | 0.77 GB | 30.8070 | +32% | 9.9% |
 | INT4, group 128 | 0.73 GB | 35.3849 | +52% | 12.3% |
 
-**INT8 is effectively free** — a 0.17% perplexity cost for a 4× reduction on
+**INT8 is effectively free**: a 0.17% perplexity cost for a 4× reduction on
 the weights it touches. **Naive INT4 is not.** Round-to-nearest with no error
 compensation costs half the model's quality, and that gap is precisely what
 GPTQ and AWQ exist to close; the number above is what a later attempt would
@@ -294,7 +294,7 @@ because NumPy has no integer GEMM:
 
 Widening the int8 weights costs far more than the matmul it feeds. So phase 6
 delivers the **footprint** reduction, which is real, and not the bandwidth win,
-which needs a kernel that consumes integers directly — phase 7.
+which needs a kernel that consumes integers directly, which is phase 7.
 
 The perplexity figures above therefore come from *simulated* quantization:
 weights are quantized and immediately dequantized, so the model computes on
@@ -309,7 +309,7 @@ output projection where errors land straight on the logits rather than being
 averaged over a hidden dimension first.
 
 That was wrong, and the sweep says so. Quantizing embeddings costs **0.02
-percentage points** more and saves another **0.41 GB** — and without them the
+percentage points** more and saves another **0.41 GB**, and without them the
 untouched embedding matrix dominates what is left, so linear-only gets 1.98 GB
 down to 0.90 while including embeddings reaches 0.50. The flag stays, but the
 conservative default was the wrong call.
@@ -322,7 +322,7 @@ so every INT4 run silently used the default. Two configurations agreeing to the
 fourth decimal is not a coincidence, and that is what surfaced it. There is now
 a regression test asserting the two produce different stored sizes.
 
-### Phase 7 — Rust kernels on the CPU
+### Phase 7: Rust kernels on the CPU
 
 Phase 6 ended with a footprint win and no speed win: NumPy has no integer GEMM,
 so holding int8 and widening per call is 30–80× *slower* than float32. The
@@ -335,9 +335,9 @@ runs without it. Per layer, projections only, best of 50, alternating A/B:
 |---|---:|---:|---:|
 | busy machine | 1.902 ms | 3.521 ms | **1.562 ms** |
 | quiet machine | 0.967 ms | 1.814 ms | **0.762 ms** |
-| | — | 0.53× | **1.22× / 1.27×** |
+| | n/a | 0.53× | **1.22× / 1.27×** |
 
-**1.2×, not 10×.** The Rust crate's own benchmark shows 10.28× — against the
+**1.2×, not 10×.** The Rust crate's own benchmark shows 10.28×, but against the
 crate's own scalar loop, which is a fair baseline for judging SIMD and a
 meaningless one for judging the project. The engine never ran a scalar loop; it
 ran OpenBLAS on twenty cores, and OpenBLAS is very good. Beating it by 22% with
@@ -347,15 +347,15 @@ Single-threaded loses outright at 0.53×. The SIMD is not what wins here.
 
 ### The bug that made parallelism look like a bad idea
 
-Output rows are independent — row *j* reads its own slice of the weights and
-writes one float — so splitting them needs no synchronisation at all. The first
+Output rows are independent (row *j* reads its own slice of the weights and
+writes one float), so splitting them needs no synchronisation at all. The first
 implementation of that was **12× slower than one thread**: 1.19 ms against
 0.094 ms on a 896×896 matvec.
 
 The decomposition was never wrong. `std::thread::scope` creates real OS threads
 at the scope and destroys them at its end, so every call paid to construct
 twenty threads for ~90 µs of work. Moving to a pool whose workers already exist
-— the only change — took the same code from 3.453 ms to 0.798 ms per layer.
+(the only change) took the same code from 3.453 ms to 0.798 ms per layer.
 
 Both kernels are still in the crate. `matvec_i8_spawn_per_call` is tested for
 bitwise agreement with the good one, so the benchmark compares two correct
@@ -368,7 +368,7 @@ column.
 
 ### Two projections are slower in Rust, and that is not noise
 
-`k_proj` and `v_proj` measure **0.32×** — a loss — in both runs.
+`k_proj` and `v_proj` measure **0.32×**, a loss, in both runs.
 
 They are 128 rows, about 10 µs of work. The ctypes boundary has a floor of
 roughly 8 µs per call, measured on a 1×1 matvec where there is nothing left but
@@ -378,22 +378,22 @@ made at all.
 
 ### What phase 7 did not do
 
-The brief says "Rust port". This is not a port — the engine is still NumPy, and
+The brief says "Rust port". This is not a port: the engine is still NumPy, and
 only the seven linear projections cross into Rust. Attention, the norms, RoPE
 and the LM head are untouched. Scaled to a token that is 45.7 → 37.5 ms of
 projection time, which is a ceiling on what these kernels can move rather than
 a token rate.
 
-The int8 projections are now wired into the forward pass — see
-[phase 7, finished](#phase-7-finished--int8-in-the-forward-pass) after phase 8,
+The int8 projections are now wired into the forward pass; see
+[phase 7, finished](#phase-7-finished-int8-in-the-forward-pass) after phase 8,
 which is what made it worth doing.
 
-**WebGPU was measured and rejected** — see
-[the GPU half](#phase-7-the-gpu-half--measured-and-rejected): the int8 kernel is
+**WebGPU was measured and rejected**; see
+[the GPU half](#phase-7-the-gpu-half-measured-and-rejected): the int8 kernel is
 a verified compute shader, and on this laptop's Iris Xe it is slower than the
 CPU kernel on every shape, so it is not wired into the engine.
 
-### Phase 8 — llama.cpp as a reference
+### Phase 8: llama.cpp as a reference
 
 Before timing this engine against llama.cpp, the two have to be computing the
 same thing. They are:
@@ -404,8 +404,8 @@ same thing. They are:
 | generation | **5/5** prompts, 64 greedy tokens each, exact |
 
 320 consecutive argmax decisions agreeing across two implementations that share
-no code. That is not a claim the logits are bitwise equal — they are not, and
-phase 3 put the floor on that at ~1e-5 — only that nothing ever moved an
+no code. That is not a claim the logits are bitwise equal (they are not, and
+phase 3 put the floor on that at ~1e-5), only that nothing ever moved an
 argmax.
 
 **Same weights, not merely the same model.** The GGUF is converted from the
@@ -430,12 +430,12 @@ into the GGUF metadata, so Qwen2.5's own `repetition_penalty: 1.1` and
 Leaving the flag off changes the continuation from "Paris. It is the largest
 city…" to "Paris. It was founded in 789 AD…".
 
-Phase 3 hit precisely this bug from the other side — the transformers reference
+Phase 3 hit precisely this bug from the other side: the transformers reference
 diverged until `repetition_penalty` was forced to 1.0. Same trap, different
 path, and the reason every sampler that could move an argmax is now pinned
 explicitly rather than inherited.
 
-### Phase 8 results — the numbers
+### Phase 8 results: the numbers
 
 Decode, milliseconds per token, each engine at its own best thread count, three
 separate measurements:
@@ -446,7 +446,7 @@ separate measurements:
 | llama.cpp f32 | 3 | 127.30 | 176.49 | 208.06 |
 | llama.cpp Q8_0 | 1 | 47.23 | 84.94 | 86.38 |
 
-Absolute numbers drift with how busy the laptop is — they always have here —
+Absolute numbers drift with how busy the laptop is, as they always have here,
 but the direction holds every time:
 
 **At f32 the two engines are a tie, with this one marginally ahead** (1.05–1.37×).
@@ -454,20 +454,20 @@ That is not a claim to have out-engineered llama.cpp. It is phase 4's thesis
 arriving on schedule: decode reads all 1.98 GB of weights to produce one 896-value
 vector, so it is bound by memory bandwidth and not by arithmetic. When the wall is
 bandwidth, a better kernel cannot help, and OpenBLAS's `sgemv` is already excellent.
-f32 is also not llama.cpp's optimized path — essentially nobody runs it that way.
+f32 is also not llama.cpp's optimized path; essentially nobody runs it that way.
 
 **llama.cpp's real advantage is quantization, 1.8–2.6×.** Q8_0 is 500.79 MiB
 against 1884.59 MiB, so it moves a quarter of the bytes, and llama.cpp has
 integer kernels that consume them directly. That is exactly the win phase 6
-identified and could not collect, and exactly what phase 7's kernels were for —
-they are written, tested and 1.22× faster than OpenBLAS, and they are still not
+identified and could not collect, and exactly what phase 7's kernels were for.
+They are written, tested and 1.22× faster than OpenBLAS, and they are still not
 wired into the forward pass. The gap between 152 and 86 ms/token is what
-finishing that would be worth. (They are now — see
-[phase 7, finished](#phase-7-finished--int8-in-the-forward-pass).)
+finishing that would be worth. (They are now; see
+[phase 7, finished](#phase-7-finished-int8-in-the-forward-pass).)
 
 **llama.cpp wins prefill outright, 2–3×** (22–45 ms/token against 69–77). Prefill
 is a compute-bound matmul over the whole prompt, which is the regime where better
-kernels do pay. (No longer true either — see below.)
+kernels do pay. (No longer true either; see below.)
 
 ### Where it landed: plain int8, not VNNI
 
@@ -507,11 +507,11 @@ thread-pool fix, decode only, int8 against llama.cpp Q8_0:
 
 | run | control (llama.cpp vs best ever) | int8 lead on minima | paired wins | sign test p |
 |---|---:|---:|---:|---:|
-| 1 | 1.16× — ok | 1.63× | 10 / 12 | 0.019 |
-| 2 | 1.50× — **failed** | 0.89× (llama.cpp ahead) | 4 / 12 | 0.93 |
-| 3 | 1.06× — ok | 1.44× | **12 / 12** | 0.0002 |
+| 1 | 1.16×, ok | 1.63× | 10 / 12 | 0.019 |
+| 2 | 1.50×, **failed** | 0.89× (llama.cpp ahead) | 4 / 12 | 0.93 |
+| 3 | 1.06×, ok | 1.44× | **12 / 12** | 0.0002 |
 
-Both clean runs pass on their own, and in the second every rep favoured int8 —
+Both clean runs pass on their own, and in the second every rep favoured int8,
 the worst by 1.09×. The decision rule was fixed before run 3 was taken, which is
 what makes it a confirmation rather than a search.
 
@@ -520,20 +520,20 @@ with the battery at 19% and charging, and the slowdown was lopsided: int8 went
 from 23 to 55 ms/token, 2.4×, while llama.cpp went 1.3×. A matvec split across
 four cores loses more to a throttled or busy CPU than one pinned to a single
 core does. So the lead is real on an idle, cool laptop and does not survive
-contention — which is a property of the engine, not just of the measurement.
+contention, which is a property of the engine, not just of the measurement.
 
 ```sh
 OPENBLAS_NUM_THREADS=6 python -m tools.bench_llamacpp --llama-cpp ../llama.cpp --reps 12
 ```
 
 Prefill is the other way round from earlier phases: on minima nanoinfer now
-leads it too, with VNNI fastest there — though the paired test was only run on
+leads it too, with VNNI fastest there, though the paired test was only run on
 decode, so that is a reading, not a claim. Prefill is a matrix-matrix product, compute-bound
 rather than memory-bound, which is exactly where 32-bytes-per-instruction pays.
 
 **What changed between "llama.cpp wins 1.65×" and this:** the Rust thread pool.
-Rayon sizes its global pool to every logical CPU — 20 here, 6 fast cores and
-8 slow ones — and splitting a memory-bound matvec evenly across them leaves the
+Rayon sizes its global pool to every logical CPU (20 here, 6 fast cores and
+8 slow ones), and splitting a memory-bound matvec evenly across them leaves the
 fast cores waiting on the slow ones. The same trap phase 8 caught llama.cpp in
 with `-t 20`, sprung on this engine instead. A sweep put both int8 kernels best
 at four threads; `nanoinfer_set_threads` now sizes the pool at load, and
@@ -558,8 +558,8 @@ made about. Measured on the real model, one decode step's activations:
 The largest element in a 4864-wide activation vector is 68× the median, so a
 per-row scale is set by that one value and the other 4863 share a range 68×
 too wide. Blocking confines each outlier to its own 32 values. The perplexity
-curve flattens there — one per 128 costs +1.37%, one per 32 costs +0.85%, one
-per 16 also +0.85% — which is presumably why llama.cpp's Q8_0 and Q8_1 both use
+curve flattens there: one per 128 costs +1.37%, one per 32 costs +0.85%, one
+per 16 also +0.85%. That is presumably why llama.cpp's Q8_0 and Q8_1 both use
 32. Overhead is one f32 per 32 bytes of activation, and activations are not what
 streams from DRAM.
 
@@ -573,8 +573,8 @@ decoded token, so that was ~300 allocations a token, and it showed as a 4.37×
 spread. Activations are now quantized once into flat buffers.
 
 **Both VNNI matmuls were single-threaded.** The float-activation path they were
-measured against uses rayon. So every VNNI number recorded before that fix —
-32.45 ms/token, the 2.2–2.6× per-shape gains, the 12-of-12 sweep — was **one
+measured against uses rayon. So every VNNI number recorded before that fix
+(32.45 ms/token, the 2.2–2.6× per-shape gains, the 12-of-12 sweep) was **one
 core against six**, which makes the instruction-level win larger than it looked
 rather than smaller. Rows are independent, so they now split the way
 `matmul_i8_parallel` splits them.
@@ -582,14 +582,14 @@ rather than smaller. Rows are independent, so they now split the way
 ### Why the earlier kernel was leaving it on the table
 
 Profiling decode on the real model put **76.6%** of the time inside the int8
-kernel — 97 calls per token, with attention, the norms, RoPE and softmax
+kernel: 97 calls per token, with attention, the norms, RoPE and softmax
 together under 10%. Python was never the problem. The kernel ran at **6.4 GB/s
 against this machine's ~24**, which says compute-bound on *converting* int8 to
 float rather than waiting for memory: it widened eight bytes at a time with
 `_mm256_cvtepi8_epi32` and did the dot product in floating point.
 
 This CPU reports `avxvnni`. VPDPBUSD takes **thirty-two bytes per instruction**
-and accumulates in i32, with no conversion in the inner loop — 2.2–2.6× on the
+and accumulates in i32, with no conversion in the inner loop: 2.2–2.6× on the
 per-layer projections, 1.39× on the LM head, which at 136M weights is the one
 shape genuinely memory-bound rather than instruction-bound. That spread across
 shapes is the diagnosis confirming itself.
@@ -599,7 +599,7 @@ kernels use the same instruction, so this was never a parallelism gap.
 
 The sign handling is the fiddly part. VPDPBUSD multiplies *unsigned* by
 *signed*, and the cheap way to satisfy that is to offset the weights rather than
-the activations — `XOR 0x80` reads `i8` as `u8` in order, adding 128 to each:
+the activations. `XOR 0x80` reads `i8` as `u8` in order, adding 128 to each:
 
 ```
 dpbusd(w ^ 0x80, xq) = Σ(w·xq) + 128·Σxq
@@ -607,11 +607,11 @@ dpbusd(w ^ 0x80, xq) = Σ(w·xq) + 128·Σxq
 
 so the correction is **one scalar per call**, because the activation vector is
 shared by every row. Offsetting the activations instead would have needed
-`128·Σw` — a different value per row, and a second pass over the weights to get
+`128·Σw`, a different value per row, and a second pass over the weights to get
 it.
 
 It is **off by default**, because it is not free: VPDPBUSD needs both operands
-as bytes, so activations carry 8 bits where they carried 32 — +0.85%
+as bytes, so activations carry 8 bits where they carried 32: +0.85%
 perplexity against an fp32 baseline, where the float-activation path costs
 +0.19%. `use_vnni(True)` opts in and returns
 what took effect, so asking on a CPU without the instruction gets `False` and
@@ -620,7 +620,7 @@ the more accurate kernel rather than a pretence.
 ### The gate that got this wrong twice
 
 The first version of this comparison had llama.cpp 1.8–2.6× **ahead**. That was
-two numbers from different runs on different days — mine at its best against
+two numbers from different runs on different days, mine at its best against
 llama.cpp's from phase 8. Measured in one process, alternating, llama.cpp came
 in at 66 rather than 85 and the apparent margin evaporated. The same error as
 phase 4's 15× cliff, reintroduced.
@@ -632,7 +632,7 @@ look *less* certain. Eight reps reported spreads of 1.4–2.2×; twenty reported
 
 What works is the paired test. The contenders already alternate inside each rep,
 so every rep is a matched pair under shared conditions, and counting wins is a
-sign test — robust to exactly the stalls that move the absolute numbers around.
+sign test, robust to exactly the stalls that move the absolute numbers around.
 
 It is not robust to stalls that hit one contender harder than the other, and
 that is how it got this wrong a third time. On a loaded laptop this engine
@@ -648,7 +648,7 @@ The first run of this comparison said nanoinfer decoded **2× faster than
 llama.cpp**. That is an extraordinary claim, and the ordinary explanation was
 the true one: llama.cpp had been given `-t 20`.
 
-This CPU is Alder Lake — 6 fast P-cores and 8 slow E-cores behind 20 logical
+This CPU is Alder Lake: 6 fast P-cores and 8 slow E-cores behind 20 logical
 threads. Splitting a memory-bound matvec evenly across them leaves the fast
 cores waiting on the slow ones:
 
@@ -660,7 +660,7 @@ cores waiting on the slow ones:
 | 20 | 264.53 | 278.12 | 181.09 |
 
 A 5.6× swing on Q8_0 from one flag. So both sides are swept, because sweeping
-only the opponent would be worse than not sweeping at all — and that turned out
+only the opponent would be worse than not sweeping at all, and that turned out
 to matter in both directions: this engine's own default of all 20 BLAS threads
 was costing it 50%.
 
@@ -674,27 +674,27 @@ build driven from MSYS `make`:
 | `Cannot create temporary file in C:\WINDOWS` | MSYS `make` strips `TMP`/`TEMP`/`TMPDIR` from every recipe, so GCC falls back to Windows' default of `C:\WINDOWS`, which is not writable |
 | same error, but only at link time | `CMAKE_*_COMPILER_LAUNCHER` covers compiling, not linking; `CMAKE_*_LINKER_LAUNCHER` is a separate variable |
 | `cpp-httplib doesn't support Windows 8 or lower` | MinGW defaults `_WIN32_WINNT` below `0x0A00`; the OS is fine, the macro is not |
-| generation returns an empty string | `--log-disable` suppresses the generated text too, but only when stdout is a pipe — correct by hand, empty from a script |
+| generation returns an empty string | `--log-disable` suppresses the generated text too, but only when stdout is a pipe: correct by hand, empty from a script |
 
 The first two are solved with a two-line shell wrapper that re-exports a
 writable temp directory and `exec "$@"`, passed as both the compiler and the
 linker launcher.
 
 
-### Phase 7, finished — int8 in the forward pass
+### Phase 7, finished: int8 in the forward pass
 
 Phase 8 ended on a number: the gap between 152 and 86 ms/token is what wiring
 phase 7's kernels into the forward pass would be worth. They now are.
 
 `quantize_model(..., dequantize=False)` keeps INT8 weights as int8 instead of
 rounding them and handing back float32, and every projection in the forward
-pass — including the LM head and the embedding lookup — goes through one
+pass, including the LM head and the embedding lookup, goes through one
 function, `linear()`, that sends an fp32 array to BLAS exactly as before and an
 int8 tensor to Rust. There is still one forward pass; the weights decide the
 route.
 
 **It computes the function phase 6 measured.** The perplexity numbers were
-taken on simulated INT8 — the same integers, dequantized. If the stored-int8
+taken on simulated INT8: the same integers, dequantized. If the stored-int8
 model computed something else, those numbers would describe a model nobody
 runs. On the tiny model the two agree to 1.3e-7 in the logits, while fp32 sits
 3.3e-3 away, so the 1e-5 gate in `tests/test_int8_engine.py` separates "same
@@ -706,7 +706,7 @@ same check is `test_real_model_int8_generates_what_simulation_does`.
 puts the loop over tokens *inside* the loop over weight rows, so each row is
 read from memory once and stays in L1 while every token is dotted against it.
 It shares its per-row dot product with the matvec, so a prompt processed in one
-call and the same prompt token by token give identical bits — asserted
+call and the same prompt token by token give identical bits, asserted
 bitwise, not to a tolerance.
 
 ### Wiring it in made it slower, and the kernel was why
@@ -722,10 +722,10 @@ fp32. Three things were wrong, found in order:
 | fp32, for reference | 52.0 |
 
 *`OPENBLAS_NUM_THREADS=4`, on a 4-core cloud Xeon with synthetic weights of the real shapes, not
-on the reference laptop — see below.*
+on the reference laptop; see below.*
 
 **The micro-benchmark was cache-hot.** `bench_kernels` times one matrix over and
-over, and a 4864×896 int8 matrix is 4 MB — it lives in L3 after the first call.
+over, and a 4864×896 int8 matrix is 4 MB, so it lives in L3 after the first call.
 The whole model is 0.5 GB and streams from DRAM every token. Timed that way, cold
 across 48 distinct matrices, the kernel moved int8 at ~13 GB/s while OpenBLAS
 moved fp32 at ~50 GB/s: a quarter of the bytes, at a quarter of the rate, for no
@@ -733,7 +733,7 @@ gain at all.
 
 **One accumulator was a serial chain.** Every FMA waited on the one before it.
 Four independent accumulators doubled the cache-hot speed (1.65 → 0.81 ms per
-layer, single-threaded) and did nothing for decode — which is how it became
+layer, single-threaded) and did nothing for decode, which is how it became
 clear the limit had moved to memory.
 
 **Hardware prefetch was not keeping up.** One sequential stream per thread does
@@ -753,7 +753,7 @@ is now the *old* kernel; rerun `tools.bench_kernels` for the new one.
 | int8, LM head fp32 | 72.3 | 87.1 |
 | int8 + embed | 48.6 | **45.1** |
 
-`int8` alone — projections in Rust, the 544 MB LM head still in BLAS — is the
+`int8` alone (projections in Rust, the 544 MB LM head still in BLAS) is the
 worst of both. Each pool's workers spin for a while after finishing, waiting
 for more work, and on four cores rayon's spinning threads and OpenBLAS's take
 turns starving each other. Quantizing the embeddings removes the only large
@@ -778,9 +778,10 @@ OPENBLAS_NUM_THREADS=1 python -m tools.bench_int8
 ```
 
 The phase 8 target is llama.cpp Q8_0 at ~86 ms/token on that laptop. Whether
-this closes it is the open question. What it can already say is that the
-remaining ~18 ms per token on the synthetic run is not the kernels — they are
-~30 ms of a ~48 ms step — but the NumPy glue around them: SiLU's sigmoid alone
+this closes it is the open question. (It did, and then some; see
+[where it landed](#where-it-landed-plain-int8-not-vnni).) What it can already say is that the
+remaining ~18 ms per token on the synthetic run is not the kernels (they are
+~30 ms of a ~48 ms step) but the NumPy glue around them: SiLU's sigmoid alone
 costs 4.5 ms a token, in both paths.
 
 ### Prefill, the sigmoid, and the ctypes floor
@@ -802,7 +803,7 @@ tokens in blocks whose activations fit in L2, and dots three tokens per pass
 so each weight load feeds three FMAs instead of one. int8 → f32 is exact and
 every token keeps its own four accumulator chains in the same order, so a
 prompt processed in one call is still bitwise the same prompt processed token
-by token — `tests/matmul.rs` now crosses a token-block boundary to prove it.
+by token; `tests/matmul.rs` now crosses a token-block boundary to prove it.
 
 It is still behind fp32 BLAS on large batches, by 1.8–2.4× per projection at
 128 tokens. Closing that needs a GEMM-style microkernel, which sums each
@@ -814,8 +815,8 @@ run, and the per-projection comparison above uses it.
 
 **The sigmoid no longer splits the array.** It computed each sign's half with
 boolean masks and scattered the halves back. Both halves share
-`e = exp(-|x|)` — the result is `1/(1+e)` on one side and `e/(1+e)` on the
-other — so one `np.where` computes the identical expression per element:
+`e = exp(-|x|)`. The result is `1/(1+e)` on one side and `e/(1+e)` on the
+other, so one `np.where` computes the identical expression per element:
 bitwise the same, 118 → 27 µs per 4864-wide call, about 2 ms a token. The
 fp32 path gets it too.
 
@@ -832,7 +833,7 @@ Q, K and V all read the same activations, and so do gate and up. When
 in one buffer, the group already *is* one matrix, and `linear_many` runs it as
 a single kernel call over all of its rows and splits the result. Each output
 row is its own dot product, so the one call returns exactly the bits the
-separate calls did — asserted bitwise. fp32 weights, and int8 weights stored
+separate calls did, asserted bitwise. fp32 weights, and int8 weights stored
 apart, take the separate calls as before.
 
 | int8 + embed, `OPENBLAS_NUM_THREADS=1` | decode, ms/token | prefill, ms/token |
@@ -844,11 +845,11 @@ apart, take the separate calls as before.
 
 That is 10–20% of decode, far more than the ~0.4 ms the 72 saved ctypes
 crossings account for. The rest is the pool: every call wakes rayon's workers
-and joins them again, and K and V were 128 rows each — 32 rows per thread on
+and joins them again, and K and V were 128 rows each: 32 rows per thread on
 four cores, almost nothing but the wakeup and the join. Prefill moves the same
 weights and does the same arithmetic either way, and does not change.
 
-### Phase 7, the GPU half — measured and rejected
+### Phase 7, the GPU half: measured and rejected
 
 The int8 matmul now exists as a WebGPU compute shader, in its own crate,
 `gpu/`. The CPU crate keeps its one dependency and its seconds-long build;
@@ -864,17 +865,17 @@ the integers the CPU kernel does. One workgroup of 64 threads computes one
 output: each thread sums a strided slice of the row, a tree in workgroup
 memory folds the 64 partial sums, and the scale is applied once at the end.
 
-**Verified against the CPU kernel**, not to the bit — the shader adds in a
+**Verified against the CPU kernel**, not to the bit (the shader adds in a
 different order (64 slices, then a tree) from the CPU's four chains of eight
-lanes, and float addition does not associate — but to float32 tolerance, on
+lanes, and float addition does not associate) but to float32 tolerance, on
 every decode shape, a batch of tokens, widths that need padding to a multiple
 of four, and a hand-worked case. A shader with its scale off by 0.1% fails
 the tests, so the tolerance has teeth.
 
 **Two limits the LM head runs into.** WebGPU caps a dispatch at 65,535
 workgroups per dimension and the LM head has 151,936 rows, so rows run along
-x and wrap into y. And a device may cap one storage binding at 128 MiB —
-Mesa's llvmpipe does — while the int8 LM head is 130 MiB, so a large matrix
+x and wrap into y. And a device may cap one storage binding at 128 MiB
+(Mesa's llvmpipe does), while the int8 LM head is 130 MiB, so a large matrix
 is uploaded as row chunks that each fit, one dispatch per chunk in a single
 submission, each writing its own rows of the shared output. Both have tests:
 70,000 rows for the wrap, and a matrix forced into seven uneven chunks that
@@ -899,7 +900,7 @@ cd gpu && cargo test --release && cargo run --release --example bench
 | lm_head 151936×896 | 4.612 | 6.805 | 1.48× |
 
 The shape of that table is the diagnosis. The GPU column barely moves from
-128 rows to 4864 — about half a millisecond either way — so it is measuring the
+128 rows to 4864, about half a millisecond either way, so it is measuring the
 round trip, not the work: upload, dispatch, map, read back, every call. The
 smaller the matrix, the worse the ratio, and the one shape big enough to
 amortise it, the LM head, still loses by 1.48×. That is the integrated-GPU
@@ -909,7 +910,7 @@ bytes are the whole game.
 
 Keeping activations resident on the GPU between layers would remove most of
 the per-call cost. It would not change the bandwidth ceiling, and decode at
-this model size is already within reach of that ceiling on the CPU — so the
+this model size is already within reach of that ceiling on the CPU, so the
 kernel stays in the tree, tested, and out of the forward pass.
 
 ## Parameter budget
@@ -940,7 +941,7 @@ is starting in the wrong place for this model size.
 
 For this model N is 32,280 bytes of JSON, so the tensor data starts at byte
 32,288. The header maps each tensor name to its dtype, its shape, and a
-`data_offsets: [begin, end)` pair — and **those offsets are relative to the
+`data_offsets: [begin, end)` pair, and **those offsets are relative to the
 start of the data buffer, not the file.** Treating them as absolute is the
 first bug everyone writes; `tests/test_safetensors.py` pins it.
 
@@ -951,7 +952,7 @@ microseconds regardless of size and the OS pages weights in as they are touched.
 ### bfloat16 has no NumPy dtype
 
 The weights are stored as bf16, which NumPy cannot represent. This is not a
-problem, because bf16 *is* float32 with the low 16 mantissa bits removed — same
+problem, because bf16 *is* float32 with the low 16 mantissa bits removed: same
 8-bit exponent, same bias. So the reader holds the raw bits as `uint16` and
 widens by shifting:
 
@@ -980,7 +981,7 @@ their own tests:
 
 Nothing about Qwen is hardcoded. The split pattern, merge table, vocabulary and
 added tokens all come out of `tokenizer.json`, and unsupported spec fields are
-rejected at load time rather than ignored — so pointing this at a different
+rejected at load time rather than ignored, so pointing this at a different
 model either works or fails loudly, never silently.
 
 ### Three things that cost real time
@@ -989,7 +990,7 @@ model either works or fails loudly, never silently.
 `regex` pattern. Python's `\s` matches the C0 separators U+001C–U+001F; the
 Unicode `White_Space` property, which Rust uses, does not. Building on `\s`
 gives a tokenizer that is correct on everything except inputs containing a file
-separator — which no small test corpus contains. The `White_Space` set is
+separator, which no small test corpus contains. The `White_Space` set is
 spelled out explicitly instead, and a test asserts the divergence is real
 rather than imagined.
 
@@ -1002,7 +1003,7 @@ survives a hand-written test list.
 **Added tokens must be extracted before the pre-tokenizer.** If `<|im_start|>`
 were fed through the split regex it would be shredded into `<`, `|`, `im`,
 `_start`, `|`, `>` and BPE would encode it as ordinary text. Every chat prompt
-would then be wrong — and still perfectly fluent.
+would then be wrong, and still perfectly fluent.
 
 ### Verification
 
@@ -1012,7 +1013,7 @@ from one seed and weighted toward where byte-level BPE actually breaks rather
 than toward realism: whitespace torture, random assigned codepoints across all
 planes, combining marks, long repeated runs, and control-token lookalikes.
 
-ChatML formatting is checked the same way — by rendering the model's real Jinja
+ChatML formatting is checked the same way: by rendering the model's real Jinja
 `chat_template` with Jinja and requiring an exact string match, rather than
 asserting against hand-written expected output.
 
@@ -1031,7 +1032,7 @@ x = x + feed_forward(rms_norm(x))
 
 The norm sits *inside* the residual branch, not around it. That is "pre-norm",
 and it leaves a path from the embedding to the output that no normalization
-ever touches — which is what makes deep transformers trainable, and at
+ever touches, which is what makes deep transformers trainable, and at
 inference means the residual stream accumulates rather than being rescaled 48
 times.
 
@@ -1048,7 +1049,7 @@ times.
 
 Nothing in attention fails loudly. Wrong RoPE convention, mask off by one, KV
 heads tiled instead of repeated, a reshape that splits the sequence across
-heads — each produces correctly-shaped finite numbers and text that still reads
+heads: each produces correctly-shaped finite numbers and text that still reads
 like English. So each is pinned by a test that compares against a *different*
 implementation rather than a restatement of the same steps.
 
@@ -1073,7 +1074,7 @@ prompts covering English, code, digit runs, CJK and a ChatML turn. Observed
 worst case is 6.2e-05, so it passes with nearly two orders of magnitude to
 spare.
 
-Divergence is located **per layer**, not just reported at the end — a drift
+Divergence is located **per layer**, not just reported at the end. A drift
 starting in layer 0 and one starting in layer 19 are different bugs. Measured
 drift is flat at ~5e-4 across all 24 layers, so what accumulates is float32
 round-off rather than a defect, and the test fails if it ever grows abruptly.
@@ -1084,7 +1085,7 @@ round-off rather than a defect, and the test fails if it ever grows abruptly.
 declaring `repetition_penalty: 1.1`, and `transformers` applies it inside
 `generate()` regardless. The obvious baseline therefore quietly downweights
 tokens already in the context. Ours and the reference agree for three tokens
-and then part company — "It is the largest city" against "It was founded in 7".
+and then part company: "It is the largest city" against "It was founded in 7".
 Chasing that as an attention bug is days aimed at the wrong thing.
 
 **`hidden_states[-1]` is after the final norm**, not the last layer's output.
@@ -1096,14 +1097,14 @@ perfectly correct code.
 Asking for the last row's logits alone reshapes the output matmul from
 `[5, 896] @ [896, 151936]` to `[1, 896] @ …`. BLAS picks different blocking,
 which changes the order 896 products are summed in, and float addition is not
-associative — so the results differ by ~1e-5 on logits reaching 19. Phase 4
+associative, so the results differ by ~1e-5 on logits reaching 19. Phase 4
 will claim the KV cache reproduces the uncached path exactly; that claim has to
 be made at this tolerance, not at zero.
 
 ## The KV cache
 
 Keys and values depend only on their own token and its position. Token 3's key
-is the same whether the sequence is 4 tokens long or 400 — so once computed it
+is the same whether the sequence is 4 tokens long or 400, so once computed it
 never needs computing again. Phase 3 recomputed all of them at every step
 anyway.
 
@@ -1127,7 +1128,7 @@ can be driven wrong:
 
 A token's position never changes, so rotating once on insert is both correct
 and cheaper than re-rotating the whole history each step. Rotating again on
-read would apply the rotation twice to every cached key — fluent output with a
+read would apply the rotation twice to every cached key: fluent output with a
 scrambled sense of order.
 
 The matching trap is on the query side: `positions` must continue past the
@@ -1139,8 +1140,8 @@ because that is what makes it dangerous.
 ### Verified by equality, not plausibility
 
 Every way of getting a cache wrong produces fluent text, so the gate is
-equality of output: the same 8 tokens split across five chunking patterns — one
-shot, one at a time, prompt-then-decode, halves, ragged — must all give what a
+equality of output: the same 8 tokens split across five chunking patterns (one
+shot, one at a time, prompt-then-decode, halves, ragged) must all give what a
 single uncached pass gives. Chunk shape is what exercises the mask offsets and
 the position arithmetic, which is where a cache actually breaks.
 
@@ -1166,7 +1167,7 @@ it makes the seed irrelevant. Greedy is kept as the reference the sampled paths
 are checked against, since it is the only setting whose output can be compared
 token for token with another engine.
 
-`SamplingConfig.from_model_dir` reads what the model itself ships — Qwen2.5
+`SamplingConfig.from_model_dir` reads what the model itself ships: Qwen2.5
 declares temperature 0.7, top-k 20, top-p 0.8. `repetition_penalty` is
 deliberately *not* read: it is a logits processor, this phase does not implement
 it, and silently honouring a declared value the engine ignores would repeat the
@@ -1189,7 +1190,7 @@ Three choices, each measured rather than asserted:
 **Per output channel, not per tensor.** One scale per tensor is dominated by
 its largest outlier and crushes every other row's resolution. On the real
 `gate_proj`: **4.86% error per-tensor against 0.85% per-channel.** The cost is
-one float per row — 896 floats against 802,816 weights.
+one float per row, 896 floats against 802,816 weights.
 
 **Symmetric, no zero point,** so a quantized value is just `q * scale` and every
 matmul stays a plain multiply. The range is `[-127, 127]` rather than the full
@@ -1197,12 +1198,12 @@ matmul stays a plain multiply. The range is `[-127, 127]` rather than the full
 exact opposites.
 
 **Group-wise scales for INT4.** Fifteen levels is far too coarse to share one
-scale across a whole row — a single large weight at the end would flatten
+scale across a whole row; a single large weight at the end would flatten
 everything before it. Groups of 128 cost ~3% overhead; group 32 cuts weight
 error from 12.3% to 9.9% and perplexity from +52% to +32%.
 
 Rounding is half-away-from-zero, not `np.round`. Banker's rounding sends 0.5 to
-0, which biases small magnitudes toward zero on a symmetric grid — and small
+0, which biases small magnitudes toward zero on a symmetric grid, and small
 magnitudes are most of a weight matrix.
 
 Norms and biases are never quantized: 43,904 parameters in total, under 0.01%
@@ -1212,7 +1213,7 @@ of the model, and they scale everything downstream of them.
 
 Scored in non-overlapping chunks rather than a sliding window. A window gives a
 lower, better-looking number at many times the compute; since every precision
-level is scored identically, the delta — the actual result — is unaffected. The
+level is scored identically, the delta (the actual result) is unaffected. The
 first token of each chunk is not scored, because it has no context.
 
 Log-probabilities come from a direct log-softmax rather than a log of the
@@ -1220,7 +1221,7 @@ softmax, which would round small probabilities to zero and return `-inf`. The
 NLL accumulates in float64: summing a few thousand float32 terms moves the
 fourth decimal, which is exactly where the INT8 delta lives.
 
-The harness is tested against closed forms, not just against itself — a uniform
+The harness is tested against closed forms, not just against itself: a uniform
 model must score exactly the vocabulary size, and a model certain of every next
 token must score exactly 1.0.
 
@@ -1231,7 +1232,7 @@ no `lm_head.weight` tensor in the file at all. The output projection reuses the
 input embedding matrix: final logits are `hidden @ embed_tokens.T`. Searching
 for an `lm_head` and not finding one is the expected outcome.
 
-**Grouped-query attention.** 14 query heads, but only 2 key-value heads — each
+**Grouped-query attention.** 14 query heads, but only 2 key-value heads; each
 KV head is shared by 7 query heads. That shrinks the KV cache by 7× (24 KiB per
 token at fp32 across all 24 layers, instead of 168 KiB), and it is where a wrong
 `repeat` or `reshape` produces text that is fluent and subtly wrong.
@@ -1376,7 +1377,7 @@ unshaded because it is an attention sink and would otherwise wash out the rest.
 **The cache changes the speed, never the answer.** Same prompt, same six
 tokens, through the engine's own decode loop with and without the cache. This
 is a short interactive run, not the controlled measurement; see
-[Phase 4](#phase-4--kv-cache) for that.
+[Phase 4](#phase-4-kv-cache) for that.
 
 ![Cache race: identical output with the cache on and off](docs/viz-cache-race.png)
 
