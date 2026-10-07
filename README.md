@@ -778,7 +778,8 @@ OPENBLAS_NUM_THREADS=1 python -m tools.bench_int8
 ```
 
 The phase 8 target is llama.cpp Q8_0 at ~86 ms/token on that laptop. Whether
-this closes it is the open question. What it can already say is that the
+this closes it is the open question. (It did, and then some; see
+[where it landed](#where-it-landed-plain-int8-not-vnni).) What it can already say is that the
 remaining ~18 ms per token on the synthetic run is not the kernels (they are
 ~30 ms of a ~48 ms step) but the NumPy glue around them: SiLU's sigmoid alone
 costs 4.5 ms a token, in both paths.
